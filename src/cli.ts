@@ -120,7 +120,8 @@ async function serviceCommand(subcommand: string | undefined, args: ServiceArgs,
         const state = agentState(role);
         // The watchdog and the app opener run briefly and exit, so "loaded" is their healthy state.
         const status = state.running ? `running (pid ${state.pid ?? '?'})` : state.loaded ? 'loaded' : 'NOT LOADED';
-        out(`${role.padEnd(9)}  ${status}${state.lastExit && state.lastExit !== '0' && !state.running ? `, last exit ${state.lastExit}` : ''}`);
+        const failed = !state.running && state.lastExit !== null && /^-?\d+$/.test(state.lastExit) && state.lastExit !== '0';
+        out(`${role.padEnd(9)}  ${status}${failed ? `, last exit code ${state.lastExit}` : ''}`);
       }
       const check = await checkService(false);
       out(`${check.local ? 'ok  ' : 'FAIL'}  local   http://127.0.0.1:${config.port}/mcp`);
