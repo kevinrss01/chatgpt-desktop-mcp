@@ -38,7 +38,7 @@ npm install -g github:kevinrss01/chatgpt-desktop-mcp
 chatgpt-desktop-mcp doctor
 ```
 
-From a clone: `npm install && npm run build && npm link`.
+The compiled CLI is committed in `dist/`, so installing from GitHub needs no build step. From a clone: `npm install && npm link`.
 
 ## Quick start
 
@@ -175,7 +175,7 @@ Pair it with a named tunnel service so the public URL stays the same across rest
 ```sh
 npm install
 npm test          # unit and protocol tests (no app needed)
-npm run build
+npm run build     # rebuild dist/ and commit it with your change
 node dist/cli.js serve --verbose
 ```
 
