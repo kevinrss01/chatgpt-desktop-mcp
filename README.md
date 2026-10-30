@@ -34,7 +34,7 @@ Codex lets only one process write to a chat at a time. The process that runs bri
 ## Install
 
 ```sh
-npm install -g github:kevinrss01/chatgpt-desktop-mcp
+npm install -g https://github.com/kevinrss01/chatgpt-desktop-mcp/tarball/main
 chatgpt-desktop-mcp doctor
 ```
 
