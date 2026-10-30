@@ -5,6 +5,7 @@ import { AppServerClient } from './appServer.js';
 import { TokenStore } from './auth.js';
 import { DesktopIpcClient } from './ipc.js';
 import { APP_BUNDLE_PATHS, configDir, ipcSocketPath, resolveCodexBinary } from './paths.js';
+import { agentState, readServiceConfig } from './service.js';
 import { errorMessage } from './util.js';
 
 interface Check {
@@ -86,6 +87,20 @@ export async function runDoctor(version: string, codexBinary?: string): Promise<
     ok: commandExists('cloudflared'),
     detail: commandExists('cloudflared') ? 'installed; --tunnel is available' : 'not installed; needed only for --tunnel',
   });
+  const service = process.platform === 'darwin' ? readServiceConfig() : null;
+  if (service) {
+    const missing = service.roles.filter((role) => !agentState(role).loaded);
+    checks.push({
+      name: 'Background service (optional)',
+      ok: missing.length === 0,
+      detail:
+        missing.length === 0
+          ? `${service.roles.length} LaunchAgents loaded${service.hostname ? `, public URL https://${service.hostname}/mcp` : ''}`
+          : `not loaded: ${missing.join(', ')}; run: chatgpt-desktop-mcp service install`,
+    });
+  } else {
+    checks.push({ name: 'Background service (optional)', ok: false, detail: 'not installed; run: chatgpt-desktop-mcp service install --hostname <host>' });
+  }
 
   for (const check of checks) process.stdout.write(`${check.ok ? 'ok  ' : 'FAIL'} ${check.name}: ${check.detail}\n`);
   return checks.filter((check) => !check.name.includes('optional')).every((check) => check.ok);

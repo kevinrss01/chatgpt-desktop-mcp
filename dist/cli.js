@@ -7,6 +7,7 @@ import { startHttpServer } from './http.js';
 import { log, setLogLevel } from './log.js';
 import { configDir } from './paths.js';
 import { createRuntime, packageVersion } from './runtime.js';
+import { agentState, checkService, installService, logDirectory, probeHealth, readServiceConfig, uninstallService } from './service.js';
 import { createMcpServer } from './tools.js';
 import { startQuickTunnel } from './tunnel.js';
 import { errorMessage } from './util.js';
@@ -20,12 +21,24 @@ Usage:
   chatgpt-desktop-mcp token list
   chatgpt-desktop-mcp token revoke <id-or-name>
   chatgpt-desktop-mcp doctor               Check the app, engine, IPC, and tokens
+  chatgpt-desktop-mcp service install [options]  Keep the server (and a named tunnel) running with launchd
+  chatgpt-desktop-mcp service status       Show the background agents and health
+  chatgpt-desktop-mcp service check [--repair] [--quiet]
+  chatgpt-desktop-mcp service uninstall    Remove the LaunchAgents (keeps the Cloudflare tunnel and DNS record)
 
 Serve options:
   --host <address>          Listen address (default 127.0.0.1)
   --port <number>           Listen port (default 8723)
-  --tunnel                  Expose the server through a Cloudflare quick tunnel
+  --tunnel                  Expose the server through a Cloudflare quick tunnel (random URL)
   --allow-origin <origin>   Allow a browser origin (repeatable)
+
+Service install options:
+  --port <number>           Local port (default 8723)
+  --hostname <host>         Public hostname on a Cloudflare zone, e.g. mcp.example.com
+  --tunnel-name <name>      Named Cloudflare tunnel to create or reuse (default chatgpt-desktop-mcp)
+  --overwrite-dns           Replace an existing DNS record for --hostname
+  --no-keep-awake           Let the Mac sleep on AC power (sleep makes the server unreachable)
+  --no-open-app             Do not open the ChatGPT app at login
 
 Shared options:
   --codex-bin <path>        Codex binary (default: the one bundled with ChatGPT.app)
@@ -36,9 +49,105 @@ Shared options:
 `;
 const SANDBOX_MODES = ['read-only', 'workspace-write', 'danger-full-access'];
 const APPROVAL_POLICIES = ['untrusted', 'on-request', 'never'];
+const HOSTNAME = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]*[a-z0-9]$/;
 function fail(message) {
     process.stderr.write(`${message}\n`);
     process.exit(1);
+}
+function parsePort(value) {
+    const port = Number(value);
+    if (!Number.isInteger(port) || port < 0 || port > 65535)
+        fail('--port must be a number between 0 and 65535');
+    return port;
+}
+async function waitForHealth(url, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        if (await probeHealth(url, 3_000))
+            return true;
+        await new Promise((resolve) => setTimeout(resolve, 1_000));
+    }
+    return false;
+}
+async function serviceCommand(subcommand, args, tokens) {
+    const out = (line) => process.stdout.write(`${line}\n`);
+    switch (subcommand) {
+        case 'install': {
+            const port = parsePort(args.port);
+            if (port === 0)
+                fail('--port must be a fixed port for the service');
+            const hostname = args.hostname?.trim().toLowerCase();
+            if (hostname !== undefined && !HOSTNAME.test(hostname))
+                fail('--hostname must be a DNS name such as mcp.example.com');
+            if (args['tunnel-name'] && !hostname)
+                fail('--tunnel-name needs --hostname');
+            const { config, agents } = installService({
+                port,
+                hostname,
+                tunnel: hostname ? (args['tunnel-name'] ?? 'chatgpt-desktop-mcp') : undefined,
+                overwriteDns: args['overwrite-dns'],
+                keepAwake: !args['no-keep-awake'],
+                openApp: !args['no-open-app'],
+            });
+            for (const agent of agents)
+                out(`loaded  ${agent}`);
+            const local = await waitForHealth(`http://127.0.0.1:${port}/healthz`, 30_000);
+            out(`${local ? 'ok  ' : 'FAIL'}  local   http://127.0.0.1:${port}/mcp`);
+            if (config.hostname) {
+                const remote = await waitForHealth(`https://${config.hostname}/healthz`, 60_000);
+                out(`${remote ? 'ok  ' : 'FAIL'}  public  https://${config.hostname}/mcp`);
+            }
+            out(`Logs: ${logDirectory()}`);
+            if (tokens.list().length === 0)
+                out('No access tokens yet. Create one for each agent with: chatgpt-desktop-mcp token create --name <agent>');
+            return;
+        }
+        case 'status': {
+            const config = readServiceConfig();
+            if (!config)
+                fail('The service is not installed. Run: chatgpt-desktop-mcp service install --hostname <host>');
+            for (const role of config.roles) {
+                const state = agentState(role);
+                // The watchdog and the app opener run briefly and exit, so "loaded" is their healthy state.
+                const status = state.running ? `running (pid ${state.pid ?? '?'})` : state.loaded ? 'loaded' : 'NOT LOADED';
+                out(`${role.padEnd(9)}  ${status}${state.lastExit && state.lastExit !== '0' && !state.running ? `, last exit ${state.lastExit}` : ''}`);
+            }
+            const check = await checkService(false);
+            out(`${check.local ? 'ok  ' : 'FAIL'}  local   http://127.0.0.1:${config.port}/mcp`);
+            if (config.hostname) {
+                const reason = check.public || check.internet !== false ? '' : ' (this Mac is offline)';
+                out(`${check.public ? 'ok  ' : 'FAIL'}  public  https://${config.hostname}/mcp${reason}`);
+            }
+            out(`Logs: ${logDirectory()}`);
+            out(`Tokens: ${tokens.list().length}`);
+            if (!check.local || check.public === false)
+                process.exitCode = 1;
+            return;
+        }
+        case 'check': {
+            const check = await checkService(args.repair);
+            const summary = `local=${check.local ? 'ok' : 'down'} public=${check.public === null ? 'n/a' : check.public ? 'ok' : 'down'}${check.internet === false ? ' internet=down' : ''}`;
+            if (!args.quiet)
+                out(summary);
+            if (check.actions.length > 0)
+                out(`${new Date().toISOString()} ${summary} -> ${check.actions.join(', ')}`);
+            if (!check.local || check.public === false)
+                process.exitCode = 1;
+            return;
+        }
+        case 'uninstall': {
+            const config = readServiceConfig();
+            uninstallService();
+            out('Removed the LaunchAgents and stopped the background server.');
+            if (config?.tunnelName) {
+                out(`Kept the Cloudflare tunnel "${config.tunnelName}"${config.hostname ? ` and the DNS record for ${config.hostname}` : ''}.`);
+                out(`To delete them: cloudflared tunnel delete ${config.tunnelName}, then remove the DNS record in the Cloudflare dashboard.`);
+            }
+            return;
+        }
+        default:
+            fail('Usage: chatgpt-desktop-mcp service install|status|check|uninstall');
+    }
 }
 async function main() {
     const { values, positionals } = parseArgs({
@@ -47,6 +156,13 @@ async function main() {
             host: { type: 'string', default: '127.0.0.1' },
             port: { type: 'string', default: '8723' },
             tunnel: { type: 'boolean', default: false },
+            hostname: { type: 'string' },
+            'tunnel-name': { type: 'string' },
+            'overwrite-dns': { type: 'boolean', default: false },
+            'no-keep-awake': { type: 'boolean', default: false },
+            'no-open-app': { type: 'boolean', default: false },
+            repair: { type: 'boolean', default: false },
+            quiet: { type: 'boolean', default: false },
             'allow-origin': { type: 'string', multiple: true },
             'codex-bin': { type: 'string' },
             'workspace-root': { type: 'string' },
@@ -120,6 +236,10 @@ async function main() {
             process.exit(healthy ? 0 : 1);
             break;
         }
+        case 'service': {
+            await serviceCommand(subcommand, values, tokens);
+            return;
+        }
         case 'stdio': {
             const runtime = createRuntime(runtimeOptions);
             const server = createMcpServer(runtime.bridge, values['read-only'] ? 'read' : 'control', runtime.version);
@@ -134,12 +254,16 @@ async function main() {
             return;
         }
         case 'serve': {
-            const port = Number(values.port);
-            if (!Number.isInteger(port) || port < 0 || port > 65535)
-                fail('--port must be a number between 0 and 65535');
+            const port = parsePort(values.port);
             if (tokens.list().length === 0) {
-                const { token, record } = tokens.create('default', 'control');
-                process.stderr.write(`\nCreated a control token (${record.id}). Store it now; it is not shown again:\n\n  ${token}\n\nSend it as: Authorization: Bearer <token>\n\n`);
+                if (process.stderr.isTTY) {
+                    const { token, record } = tokens.create('default', 'control');
+                    process.stderr.write(`\nCreated a control token (${record.id}). Store it now; it is not shown again:\n\n  ${token}\n\nSend it as: Authorization: Bearer <token>\n\n`);
+                }
+                else {
+                    // Never print a new secret into a log file (launchd, nohup, CI). Tokens created later work without a restart.
+                    log.warn('No access tokens yet, so every request will be rejected. Create one with: chatgpt-desktop-mcp token create');
+                }
             }
             const runtime = createRuntime(runtimeOptions);
             const http = await startHttpServer({
