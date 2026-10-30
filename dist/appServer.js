@@ -205,7 +205,8 @@ export class AppServerClient extends EventEmitter {
         }
     }
     handleExit(child, error) {
-        if (this.child !== child && this.child !== null)
+        // A child replaced or stopped on purpose (stop() clears this.child first) needs no handling.
+        if (this.child !== child)
             return;
         this.child = null;
         this.ready = false;

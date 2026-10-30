@@ -241,7 +241,8 @@ export class AppServerClient extends EventEmitter {
   }
 
   private handleExit(child: ChildProcessWithoutNullStreams, error: Error): void {
-    if (this.child !== child && this.child !== null) return;
+    // A child replaced or stopped on purpose (stop() clears this.child first) needs no handling.
+    if (this.child !== child) return;
     this.child = null;
     this.ready = false;
     const detail = this.stderrTail.at(-1);
