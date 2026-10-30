@@ -1,0 +1,50 @@
+{
+  "name": "chatgpt-desktop-mcp",
+  "version": "0.1.0",
+  "description": "MCP server that lets other agents list, read, start, and steer Codex chats in the ChatGPT desktop app on macOS.",
+  "type": "module",
+  "bin": {
+    "chatgpt-desktop-mcp": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepare": "npm run build",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "start": "node dist/cli.js serve"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "chatgpt",
+    "codex",
+    "desktop",
+    "agents"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kevinrss01/chatgpt-desktop-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/kevinrss01/chatgpt-desktop-mcp/issues"
+  },
+  "homepage": "https://github.com/kevinrss01/chatgpt-desktop-mcp#readme",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.5"
+  }
+}
