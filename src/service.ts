@@ -1,5 +1,6 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { accessSync, constants, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { resolveNs } from 'node:dns/promises';
+import { accessSync, constants, existsSync, mkdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { delimiter, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -7,22 +8,59 @@ import { APP_BUNDLE_PATHS, configDir } from './paths.js';
 import { errorMessage, isRecord } from './util.js';
 
 /**
- * Keeps the MCP server reachable with macOS LaunchAgents: the server and the
- * Cloudflare tunnel restart when they exit, a watchdog restarts whichever stops
- * answering, and everything starts again at login.
+ * Keeps the MCP server reachable with macOS LaunchAgents: the server and an
+ * optional Cloudflare tunnel restart when they exit, a watchdog restarts
+ * whichever stops answering, and everything starts again at login.
  */
 
 export const LABEL_PREFIX = 'com.chatgpt-desktop-mcp';
 export const ROLES = ['server', 'tunnel', 'watchdog', 'keepawake', 'openapp'] as const;
 export type Role = (typeof ROLES)[number];
+export const KEEP_AWAKE_MODES = ['ac', 'always', 'off'] as const;
+export type KeepAwake = (typeof KEEP_AWAKE_MODES)[number];
+export const DEFAULT_PORT = 8723;
+export const DEFAULT_TUNNEL_NAME = 'chatgpt-desktop-mcp';
 
-export interface ServiceConfig {
-  version: 1;
+/** Options passed to `serve` in the background server. */
+export interface ServeSettings {
+  sandbox?: string;
+  approvalPolicy?: string;
+  workspaceRoot?: string;
+  codexBin?: string;
+  allowOrigins?: string[];
+}
+
+export interface ServiceSettings {
   port: number;
+  /** Hostname published through a named Cloudflare tunnel that the service runs. */
   hostname: string | null;
   tunnelName: string | null;
+  /** Base URL of a tunnel or proxy you run yourself. The service only monitors it. */
+  publicUrl: string | null;
+  keepAwake: KeepAwake;
+  openApp: boolean;
+  serve: ServeSettings;
+}
+
+export interface ServiceConfig extends ServiceSettings {
+  version: 1;
   tunnelId: string | null;
+  /** Resolved node binary the agents run, which is what macOS privacy settings list. */
+  node: string | null;
   roles: Role[];
+}
+
+/** Values given on the command line; anything left undefined keeps the saved setting. */
+export interface SettingsInput {
+  port?: number;
+  hostname?: string;
+  tunnelName?: string;
+  publicUrl?: string;
+  localOnly?: boolean;
+  keepAwake?: KeepAwake;
+  openApp?: boolean;
+  serve?: ServeSettings;
+  reset?: boolean;
 }
 
 export interface AgentSpec {
@@ -36,18 +74,16 @@ export interface AgentSpec {
 }
 
 export interface InstallOptions {
-  port: number;
-  tunnel?: string;
-  hostname?: string;
   overwriteDns?: boolean;
-  keepAwake: boolean;
-  openApp: boolean;
+  skipZoneCheck?: boolean;
   nodePath?: string;
 }
 
 const WATCHDOG_INTERVAL_SECONDS = 120;
 const PUBLIC_FAILURES_BEFORE_RESTART = 2;
 const BOOTSTRAP_ATTEMPTS = 10;
+const HOSTNAME = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]*[a-z0-9]$/;
+const TUNNEL_NAME = /^[A-Za-z0-9][\w.-]{0,62}$/;
 
 function sleepSync(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
@@ -71,6 +107,124 @@ function serviceConfigPath(): string {
 
 function watchdogStatePath(): string {
   return join(configDir(), 'watchdog-state.json');
+}
+
+/** Written by the background server after it checks access to the folder where new chats go. */
+export function folderAccessPath(): string {
+  return join(configDir(), 'folder-access.json');
+}
+
+export function readFolderAccess(): { folder: string; state: string; node: string; checkedAt: string } | null {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(folderAccessPath(), 'utf8'));
+    if (!isRecord(parsed) || typeof parsed.folder !== 'string' || typeof parsed.state !== 'string') return null;
+    return {
+      folder: parsed.folder,
+      state: parsed.state,
+      node: typeof parsed.node === 'string' ? parsed.node : '',
+      checkedAt: typeof parsed.checkedAt === 'string' ? parsed.checkedAt : '',
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function normalizeHostname(value: string): string {
+  const hostname = value.trim().toLowerCase().replace(/\.$/, '');
+  if (/^[a-z]+:\/\//.test(hostname) || hostname.includes('/')) {
+    throw new Error('--hostname takes a bare hostname such as mcp.example.com. Use --public-url for a full URL.');
+  }
+  if (!HOSTNAME.test(hostname)) throw new Error(`"${value}" is not a valid hostname, e.g. mcp.example.com`);
+  return hostname;
+}
+
+/** Normalizes a public base URL: no trailing slash, no trailing /mcp, no query. */
+export function normalizePublicUrl(value: string): string {
+  let url: URL;
+  try {
+    url = new URL(value.trim());
+  } catch {
+    throw new Error(`"${value}" is not a valid URL, e.g. https://mcp.example.com`);
+  }
+  if (url.protocol !== 'https:' && url.protocol !== 'http:') throw new Error('--public-url must start with https:// or http://');
+  if (url.username || url.password) throw new Error('--public-url must not contain credentials');
+  const path = url.pathname.replace(/\/+$/, '').replace(/\/mcp$/, '');
+  return `${url.origin}${path}`;
+}
+
+function cleanServeSettings(value: ServeSettings | undefined): ServeSettings {
+  const result: ServeSettings = {};
+  if (!value) return result;
+  if (value.sandbox) result.sandbox = value.sandbox;
+  if (value.approvalPolicy) result.approvalPolicy = value.approvalPolicy;
+  if (value.workspaceRoot) result.workspaceRoot = value.workspaceRoot;
+  if (value.codexBin) result.codexBin = value.codexBin;
+  if (value.allowOrigins && value.allowOrigins.length > 0) result.allowOrigins = [...value.allowOrigins];
+  return result;
+}
+
+/**
+ * Combines command-line values with the settings saved by the previous install,
+ * so running install again after an upgrade keeps the same URL and options.
+ */
+export function resolveServiceSettings(input: SettingsInput, saved: ServiceSettings | null): ServiceSettings {
+  const base = input.reset ? null : saved;
+  const exposures = [input.hostname !== undefined, input.publicUrl !== undefined, input.localOnly === true].filter(Boolean).length;
+  if (exposures > 1) throw new Error('Use only one of --hostname, --public-url, and --local-only.');
+
+  let hostname = base?.hostname ?? null;
+  let tunnelName = base?.tunnelName ?? null;
+  let publicUrl = base?.publicUrl ?? null;
+  if (input.localOnly) {
+    hostname = null;
+    tunnelName = null;
+    publicUrl = null;
+  }
+  if (input.hostname !== undefined) {
+    if (!hostname) tunnelName = null;
+    hostname = normalizeHostname(input.hostname);
+    publicUrl = null;
+  }
+  if (input.publicUrl !== undefined) {
+    publicUrl = normalizePublicUrl(input.publicUrl);
+    hostname = null;
+    tunnelName = null;
+  }
+  if (input.tunnelName !== undefined) {
+    if (!hostname) throw new Error('--tunnel-name needs --hostname.');
+    if (!TUNNEL_NAME.test(input.tunnelName)) throw new Error('--tunnel-name may contain letters, digits, ".", "_", and "-" (up to 63 characters).');
+    tunnelName = input.tunnelName;
+  }
+  if (hostname && !tunnelName) tunnelName = DEFAULT_TUNNEL_NAME;
+
+  const port = input.port ?? base?.port ?? DEFAULT_PORT;
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('--port must be a number between 1 and 65535');
+  return {
+    port,
+    hostname,
+    tunnelName,
+    publicUrl,
+    keepAwake: input.keepAwake ?? base?.keepAwake ?? 'ac',
+    openApp: input.openApp ?? base?.openApp ?? true,
+    serve: { ...cleanServeSettings(base?.serve), ...cleanServeSettings(input.serve) },
+  };
+}
+
+/** The URL agents use, without the /mcp suffix, or null when the server is local only. */
+export function publicBaseUrl(settings: Pick<ServiceSettings, 'hostname' | 'publicUrl'>): string | null {
+  if (settings.hostname) return `https://${settings.hostname}`;
+  return settings.publicUrl;
+}
+
+export function serveArguments(settings: ServiceSettings): string[] {
+  const args = ['serve', '--host', '127.0.0.1', '--port', String(settings.port)];
+  const { serve } = settings;
+  if (serve.sandbox) args.push('--sandbox', serve.sandbox);
+  if (serve.approvalPolicy) args.push('--approval-policy', serve.approvalPolicy);
+  if (serve.workspaceRoot) args.push('--workspace-root', serve.workspaceRoot);
+  if (serve.codexBin) args.push('--codex-bin', serve.codexBin);
+  for (const origin of serve.allowOrigins ?? []) args.push('--allow-origin', origin);
+  return args;
 }
 
 function xmlEscape(value: string): string {
@@ -166,35 +320,117 @@ function unloadAgent(role: Role): void {
   if (existsSync(path)) unlinkSync(path);
 }
 
+function parseServeSettings(value: unknown): ServeSettings {
+  if (!isRecord(value)) return {};
+  return cleanServeSettings({
+    sandbox: typeof value.sandbox === 'string' ? value.sandbox : undefined,
+    approvalPolicy: typeof value.approvalPolicy === 'string' ? value.approvalPolicy : undefined,
+    workspaceRoot: typeof value.workspaceRoot === 'string' ? value.workspaceRoot : undefined,
+    codexBin: typeof value.codexBin === 'string' ? value.codexBin : undefined,
+    allowOrigins: Array.isArray(value.allowOrigins) ? value.allowOrigins.filter((origin): origin is string => typeof origin === 'string') : undefined,
+  });
+}
+
 export function readServiceConfig(): ServiceConfig | null {
   if (!existsSync(serviceConfigPath())) return null;
   const parsed: unknown = JSON.parse(readFileSync(serviceConfigPath(), 'utf8'));
   if (!isRecord(parsed) || typeof parsed.port !== 'number' || !Array.isArray(parsed.roles)) return null;
+  const roles = parsed.roles.filter((role): role is Role => (ROLES as readonly string[]).includes(String(role)));
+  const keepAwake = (KEEP_AWAKE_MODES as readonly unknown[]).includes(parsed.keepAwake) ? (parsed.keepAwake as KeepAwake) : null;
   return {
     version: 1,
     port: parsed.port,
     hostname: typeof parsed.hostname === 'string' ? parsed.hostname : null,
     tunnelName: typeof parsed.tunnelName === 'string' ? parsed.tunnelName : null,
     tunnelId: typeof parsed.tunnelId === 'string' ? parsed.tunnelId : null,
-    roles: parsed.roles.filter((role): role is Role => (ROLES as readonly string[]).includes(String(role))),
+    node: typeof parsed.node === 'string' ? parsed.node : null,
+    publicUrl: typeof parsed.publicUrl === 'string' ? parsed.publicUrl : null,
+    // Files written by 0.1.x only list roles.
+    keepAwake: keepAwake ?? (roles.includes('keepawake') ? 'ac' : 'off'),
+    openApp: typeof parsed.openApp === 'boolean' ? parsed.openApp : roles.includes('openapp'),
+    serve: parseServeSettings(parsed.serve),
+    roles,
   };
+}
+
+/** Path of the Cloudflare origin certificate from `cloudflared tunnel login`, honoring TUNNEL_ORIGIN_CERT. */
+function originCertificate(): string | null {
+  const explicit = process.env.TUNNEL_ORIGIN_CERT?.trim();
+  if (explicit) return existsSync(explicit) ? explicit : null;
+  const candidates = [join(homedir(), '.cloudflared'), join(homedir(), '.cloudflare-warp'), join(homedir(), 'cloudflare-warp'), '/etc/cloudflared', '/usr/local/etc/cloudflared'];
+  return candidates.map((directory) => join(directory, 'cert.pem')).find((path) => existsSync(path)) ?? null;
 }
 
 function cloudflaredJson(cloudflared: string, args: string[]): unknown {
   return JSON.parse(execFileSync(cloudflared, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
 }
 
-/** Returns the id of the named tunnel, creating it if needed. Requires `cloudflared tunnel login`. */
+/** Returns the id of the named tunnel, creating it if needed. */
 function ensureTunnel(cloudflared: string, name: string): string {
-  if (!existsSync(join(homedir(), '.cloudflared', 'cert.pem'))) {
-    throw new Error('Cloudflare is not logged in on this Mac. Run: cloudflared tunnel login');
-  }
   const tunnels = cloudflaredJson(cloudflared, ['tunnel', 'list', '--output', 'json']);
   const existing = Array.isArray(tunnels) ? tunnels.find((tunnel) => isRecord(tunnel) && tunnel.name === name) : undefined;
   if (isRecord(existing) && typeof existing.id === 'string') return existing.id;
   const created = cloudflaredJson(cloudflared, ['tunnel', 'create', '--output', 'json', name]);
   if (isRecord(created) && typeof created.id === 'string') return created.id;
   throw new Error(`cloudflared did not return an id for tunnel ${name}`);
+}
+
+/** Finds the nameservers of the closest DNS zone that contains `hostname`. */
+async function zoneNameservers(hostname: string): Promise<{ zone: string; nameservers: string[] } | null> {
+  const labels = hostname.split('.');
+  for (let index = 0; index < labels.length - 1; index += 1) {
+    const zone = labels.slice(index).join('.');
+    try {
+      const nameservers = await resolveNs(zone);
+      if (nameservers.length > 0) return { zone, nameservers };
+    } catch {
+      // Not a zone apex; keep walking up.
+    }
+  }
+  return null;
+}
+
+/** Name of the Cloudflare zone that `cloudflared tunnel login` authorized, or null if it cannot be read. */
+async function loginZone(certificate: string): Promise<string | null> {
+  try {
+    const block = /-----BEGIN ARGO TUNNEL TOKEN-----([\s\S]*?)-----END ARGO TUNNEL TOKEN-----/.exec(readFileSync(certificate, 'utf8'));
+    if (!block?.[1]) return null;
+    const token: unknown = JSON.parse(Buffer.from(block[1].replace(/\s/g, ''), 'base64').toString('utf8'));
+    if (!isRecord(token) || typeof token.zoneID !== 'string' || typeof token.apiToken !== 'string') return null;
+    // The same request cloudflared makes with this token; it only goes to the Cloudflare API.
+    const response = await fetch(`https://api.cloudflare.com/client/v4/zones/${encodeURIComponent(token.zoneID)}`, {
+      headers: { authorization: `Bearer ${token.apiToken}` },
+      signal: AbortSignal.timeout(10_000),
+    });
+    const body: unknown = await response.json();
+    return isRecord(body) && isRecord(body.result) && typeof body.result.name === 'string' ? body.result.name.toLowerCase() : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * cloudflared creates the DNS record in the zone it is logged in to. A hostname
+ * from another domain would silently become "<hostname>.<login zone>", so stop first.
+ */
+async function assertHostnameZone(hostname: string, certificate: string): Promise<void> {
+  const zone = await loginZone(certificate);
+  if (zone) {
+    if (hostname === zone || hostname.endsWith(`.${zone}`)) return;
+    throw new Error(
+      `The Cloudflare login on this Mac is for ${zone}, so cloudflared would create ${hostname}.${zone} instead of ${hostname}.\n` +
+        `Run "cloudflared tunnel login" and pick the domain of ${hostname} (or set TUNNEL_ORIGIN_CERT to that domain's cert.pem), then run install again.`,
+    );
+  }
+  // The zone could not be read (offline or an old certificate): at least make sure the domain is on Cloudflare.
+  const found = await zoneNameservers(hostname);
+  if (!found) return; // Offline or unknown: let cloudflared decide.
+  if (found.nameservers.some((nameserver) => /\.ns\.cloudflare\.com\.?$/i.test(nameserver))) return;
+  throw new Error(
+    `${found.zone} uses ${found.nameservers.join(', ')}, not Cloudflare DNS, so a Cloudflare tunnel cannot publish ${hostname}.\n` +
+      'Add the domain to Cloudflare (the free plan works), or run your own tunnel or proxy and use --public-url.\n' +
+      'Pass --skip-zone-check to bypass this check.',
+  );
 }
 
 function routeHostname(cloudflared: string, tunnelId: string, hostname: string, overwrite: boolean): void {
@@ -207,35 +443,54 @@ function routeHostname(cloudflared: string, tunnelId: string, hostname: string, 
   throw new Error(`Could not route ${hostname} to the tunnel: ${output.trim()}\nUse --overwrite-dns to replace an existing DNS record.`);
 }
 
-export function installService(options: InstallOptions): { config: ServiceConfig; agents: string[] } {
+function tunnelCredentials(tunnelId: string, certificate: string): string {
+  const candidates = [join(dirname(certificate), `${tunnelId}.json`), join(homedir(), '.cloudflared', `${tunnelId}.json`)];
+  const found = candidates.find((path) => existsSync(path));
+  if (!found) throw new Error(`Tunnel credentials not found (${candidates.join(' or ')}). The tunnel was probably created on another machine; pick a new --tunnel-name.`);
+  return found;
+}
+
+/** Environment for the agents, so they use the same config folder and Codex home as the install command. */
+function agentEnvironment(node: string): Record<string, string> {
+  const path = [dirname(node), '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin'];
+  const env: Record<string, string> = { PATH: [...new Set(path)].join(':'), CHATGPT_DESKTOP_MCP_CONFIG_DIR: configDir() };
+  for (const key of ['CODEX_HOME', 'CHATGPT_DESKTOP_MCP_CODEX_BIN', 'CHATGPT_DESKTOP_MCP_LOG']) {
+    const value = process.env[key]?.trim();
+    if (value) env[key] = value;
+  }
+  return env;
+}
+
+export async function installService(settings: ServiceSettings, options: InstallOptions = {}): Promise<{ config: ServiceConfig; agents: string[] }> {
   if (process.platform !== 'darwin') throw new Error('The service command manages macOS LaunchAgents.');
   const node = options.nodePath ?? findExecutable('node') ?? process.execPath;
   const cli = fileURLToPath(new URL('./cli.js', import.meta.url));
   const logs = logDirectory();
   mkdirSync(logs, { recursive: true });
-  const path = [dirname(node), '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin'].join(':');
+  mkdirSync(configDir(), { recursive: true, mode: 0o700 });
+  const env = agentEnvironment(node);
 
   const specs = new Map<Role, AgentSpec>();
   specs.set('server', {
     label: label('server'),
-    program: [node, cli, 'serve', '--host', '127.0.0.1', '--port', String(options.port)],
+    program: [node, cli, ...serveArguments(settings)],
     runAtLoad: true,
     keepAlive: true,
     logFile: join(logs, 'server.log'),
-    env: { PATH: path },
+    env,
   });
 
   let tunnelId: string | null = null;
-  if (options.tunnel) {
+  if (settings.hostname && settings.tunnelName) {
     const cloudflared = findExecutable('cloudflared');
     if (!cloudflared) throw new Error('cloudflared is not installed. Install it with: brew install cloudflared');
-    tunnelId = ensureTunnel(cloudflared, options.tunnel);
-    if (options.hostname) routeHostname(cloudflared, tunnelId, options.hostname, options.overwriteDns ?? false);
-    const credentials = join(homedir(), '.cloudflared', `${tunnelId}.json`);
-    if (!existsSync(credentials)) throw new Error(`Tunnel credentials not found at ${credentials}. Create the tunnel on this Mac.`);
+    const certificate = originCertificate();
+    if (!certificate) throw new Error('Cloudflare is not logged in on this Mac. Run: cloudflared tunnel login');
+    if (!options.skipZoneCheck) await assertHostnameZone(settings.hostname, certificate);
+    tunnelId = ensureTunnel(cloudflared, settings.tunnelName);
+    routeHostname(cloudflared, tunnelId, settings.hostname, options.overwriteDns ?? false);
     const tunnelConfig = join(configDir(), 'cloudflared.yml');
-    mkdirSync(configDir(), { recursive: true, mode: 0o700 });
-    writeFileSync(tunnelConfig, renderTunnelConfig(tunnelId, credentials, options.port, options.hostname ?? null), { mode: 0o600 });
+    writeFileSync(tunnelConfig, renderTunnelConfig(tunnelId, tunnelCredentials(tunnelId, certificate), settings.port, settings.hostname), { mode: 0o600 });
     specs.set('tunnel', {
       label: label('tunnel'),
       program: [cloudflared, 'tunnel', '--no-autoupdate', '--loglevel', 'warn', '--config', tunnelConfig, 'run', tunnelId],
@@ -252,28 +507,27 @@ export function installService(options: InstallOptions): { config: ServiceConfig
     keepAlive: false,
     startInterval: WATCHDOG_INTERVAL_SECONDS,
     logFile: join(logs, 'watchdog.log'),
-    env: { PATH: path },
+    env,
   });
-  if (options.keepAwake) {
-    // -s prevents system sleep only while the Mac is on AC power.
-    specs.set('keepawake', { label: label('keepawake'), program: ['/usr/bin/caffeinate', '-s'], runAtLoad: true, keepAlive: true, logFile: join(logs, 'keepawake.log') });
+  if (settings.keepAwake !== 'off') {
+    // -s blocks system sleep on AC power; -i also blocks idle sleep on battery.
+    const flags = settings.keepAwake === 'always' ? ['-i', '-s'] : ['-s'];
+    specs.set('keepawake', { label: label('keepawake'), program: ['/usr/bin/caffeinate', ...flags], runAtLoad: true, keepAlive: true, logFile: join(logs, 'keepawake.log') });
   }
-  if (options.openApp) {
+  if (settings.openApp) {
     const bundle = APP_BUNDLE_PATHS.find((candidate) => existsSync(candidate));
     if (bundle) {
       specs.set('openapp', { label: label('openapp'), program: ['/usr/bin/open', '-g', bundle], runAtLoad: true, keepAlive: false, logFile: join(logs, 'openapp.log') });
     }
   }
 
-  const config: ServiceConfig = {
-    version: 1,
-    port: options.port,
-    hostname: options.hostname ?? null,
-    tunnelName: options.tunnel ?? null,
-    tunnelId,
-    roles: [...specs.keys()],
-  };
-  mkdirSync(configDir(), { recursive: true, mode: 0o700 });
+  let resolvedNode: string | null = null;
+  try {
+    resolvedNode = realpathSync(node);
+  } catch {
+    resolvedNode = node;
+  }
+  const config: ServiceConfig = { version: 1, ...settings, tunnelId, node: resolvedNode, roles: [...specs.keys()] };
   writeFileSync(serviceConfigPath(), `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
   for (const role of ROLES) if (!specs.has(role)) unloadAgent(role);
   for (const [role, spec] of specs) loadAgent(role, spec);
@@ -282,7 +536,7 @@ export function installService(options: InstallOptions): { config: ServiceConfig
 
 export function uninstallService(): Role[] {
   for (const role of ROLES) unloadAgent(role);
-  for (const file of [serviceConfigPath(), watchdogStatePath()]) if (existsSync(file)) unlinkSync(file);
+  for (const file of [serviceConfigPath(), watchdogStatePath(), folderAccessPath()]) if (existsSync(file)) unlinkSync(file);
   return [...ROLES];
 }
 
@@ -325,9 +579,9 @@ export interface CheckResult {
 
 /**
  * Health check used by the watchdog. With repair, it restarts the server when
- * localhost stops answering, and restarts the tunnel when the public URL fails
- * twice in a row while the internet and the local server are up. Only repair
- * runs count toward that limit, so manual status checks never trigger a restart.
+ * localhost stops answering, and restarts the tunnel it manages when the public
+ * URL fails twice in a row while the internet and the local server are up.
+ * Only repair runs count toward that limit, so status checks never trigger a restart.
  */
 export async function checkService(repair: boolean): Promise<CheckResult> {
   const config = readServiceConfig();
@@ -340,12 +594,13 @@ export async function checkService(repair: boolean): Promise<CheckResult> {
     actions.push('restarted server');
   }
 
+  const base = publicBaseUrl(config);
   let publicOk: boolean | null = null;
   let internet: boolean | null = null;
-  if (config.hostname) {
-    publicOk = await probeHealth(`https://${config.hostname}/healthz`, 10_000);
+  if (base) {
+    publicOk = await probeHealth(`${base}/healthz`, 10_000);
     if (!publicOk) internet = await probeHealth('https://1.1.1.1/cdn-cgi/trace', 5_000);
-    if (!repair) return { local, public: publicOk, internet, actions };
+    if (!repair || !config.roles.includes('tunnel')) return { local, public: publicOk, internet, actions };
     let failures = 0;
     try {
       const state: unknown = JSON.parse(readFileSync(watchdogStatePath(), 'utf8'));
@@ -357,7 +612,7 @@ export async function checkService(repair: boolean): Promise<CheckResult> {
       failures = 0;
     } else {
       if (internet && local) failures += 1;
-      if (failures >= PUBLIC_FAILURES_BEFORE_RESTART && config.roles.includes('tunnel')) {
+      if (failures >= PUBLIC_FAILURES_BEFORE_RESTART) {
         launchctl(['kickstart', '-k', `${domain}/${label('tunnel')}`]);
         actions.push('restarted tunnel');
         failures = 0;

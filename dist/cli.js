@@ -1,13 +1,16 @@
 #!/usr/bin/env node
+import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { TokenStore } from './auth.js';
 import { runDoctor } from './doctor.js';
 import { startHttpServer } from './http.js';
 import { log, setLogLevel } from './log.js';
-import { configDir } from './paths.js';
+import { configDir, defaultWorkspaceRoot } from './paths.js';
+import { protectedFolder, saveFolderAccess, watchFolderAccess } from './permissions.js';
 import { createRuntime, packageVersion } from './runtime.js';
-import { agentState, checkService, installService, logDirectory, probeHealth, readServiceConfig, uninstallService } from './service.js';
+import { DEFAULT_PORT, KEEP_AWAKE_MODES, agentState, checkService, folderAccessPath, installService, logDirectory, probeHealth, publicBaseUrl, readServiceConfig, readFolderAccess, resolveServiceSettings, uninstallService, } from './service.js';
 import { createMcpServer } from './tools.js';
 import { startQuickTunnel } from './tunnel.js';
 import { errorMessage } from './util.js';
@@ -32,13 +35,18 @@ Serve options:
   --tunnel                  Expose the server through a Cloudflare quick tunnel (random URL)
   --allow-origin <origin>   Allow a browser origin (repeatable)
 
-Service install options:
-  --port <number>           Local port (default 8723)
-  --hostname <host>         Public hostname on a Cloudflare zone, e.g. mcp.example.com
-  --tunnel-name <name>      Named Cloudflare tunnel to create or reuse (default chatgpt-desktop-mcp)
+Service install options (saved; running install again reuses them, and options you pass replace them):
+  --hostname <host>         Publish on your own domain through a named Cloudflare tunnel, e.g. mcp.example.com
+  --tunnel-name <name>      Cloudflare tunnel to create or reuse (default chatgpt-desktop-mcp)
   --overwrite-dns           Replace an existing DNS record for --hostname
-  --no-keep-awake           Let the Mac sleep on AC power (sleep makes the server unreachable)
-  --no-open-app             Do not open the ChatGPT app at login
+  --skip-zone-check         Skip the check that the hostname's domain uses Cloudflare DNS
+  --public-url <url>        Use a tunnel or proxy you run yourself (Tailscale Funnel, ngrok, nginx...); monitored only
+  --local-only              Remove the saved hostname or public URL
+  --port <number>           Local port (default 8723)
+  --keep-awake <mode>       ac: no idle sleep on AC power (default) | always: also on battery | off
+  --open-app, --no-open-app Open the ChatGPT app at login (default: on)
+  --reset                   Ignore the saved settings and start from the defaults
+  --sandbox, --approval-policy, --workspace-root, --codex-bin, and --allow-origin are passed to the background server.
 
 Shared options:
   --codex-bin <path>        Codex binary (default: the one bundled with ChatGPT.app)
@@ -49,7 +57,6 @@ Shared options:
 `;
 const SANDBOX_MODES = ['read-only', 'workspace-write', 'danger-full-access'];
 const APPROVAL_POLICIES = ['untrusted', 'on-request', 'never'];
-const HOSTNAME = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]*[a-z0-9]$/;
 function fail(message) {
     process.stderr.write(`${message}\n`);
     process.exit(1);
@@ -69,43 +76,110 @@ async function waitForHealth(url, timeoutMs) {
     }
     return false;
 }
-async function serviceCommand(subcommand, args, tokens) {
+function describeSettings(settings) {
+    const base = publicBaseUrl(settings);
+    const exposure = settings.hostname
+        ? `${base}/mcp (Cloudflare tunnel "${settings.tunnelName}")`
+        : settings.publicUrl
+            ? `${base}/mcp (your own tunnel or proxy, monitored only)`
+            : 'none, this Mac only';
+    const keepAwake = { ac: 'on AC power', always: 'always, also on battery', off: 'off' }[settings.keepAwake];
+    const serve = [];
+    if (settings.serve.sandbox)
+        serve.push(`--sandbox ${settings.serve.sandbox}`);
+    if (settings.serve.approvalPolicy)
+        serve.push(`--approval-policy ${settings.serve.approvalPolicy}`);
+    if (settings.serve.workspaceRoot)
+        serve.push(`--workspace-root ${settings.serve.workspaceRoot}`);
+    if (settings.serve.codexBin)
+        serve.push(`--codex-bin ${settings.serve.codexBin}`);
+    for (const origin of settings.serve.allowOrigins ?? [])
+        serve.push(`--allow-origin ${origin}`);
+    return [
+        `Public URL:   ${exposure}`,
+        `Local URL:    http://127.0.0.1:${settings.port}/mcp`,
+        `Keep awake:   ${keepAwake}`,
+        `Open ChatGPT: ${settings.openApp ? 'at login' : 'no'}`,
+        `Server flags: ${serve.length > 0 ? serve.join(' ') : 'none (chats use your Codex settings)'}`,
+    ];
+}
+async function serviceCommand(subcommand, args, serve, tokens) {
     const out = (line) => process.stdout.write(`${line}\n`);
     switch (subcommand) {
         case 'install': {
-            const port = parsePort(args.port);
-            if (port === 0)
-                fail('--port must be a fixed port for the service');
-            const hostname = args.hostname?.trim().toLowerCase();
-            if (hostname !== undefined && !HOSTNAME.test(hostname))
-                fail('--hostname must be a DNS name such as mcp.example.com');
-            if (args['tunnel-name'] && !hostname)
-                fail('--tunnel-name needs --hostname');
-            const { config, agents } = installService({
-                port,
-                hostname,
-                tunnel: hostname ? (args['tunnel-name'] ?? 'chatgpt-desktop-mcp') : undefined,
-                overwriteDns: args['overwrite-dns'],
-                keepAwake: !args['no-keep-awake'],
-                openApp: !args['no-open-app'],
-            });
+            if (args['open-app'] && args['no-open-app'])
+                fail('Use either --open-app or --no-open-app.');
+            const keepAwake = args['no-keep-awake'] ? 'off' : args['keep-awake'];
+            if (keepAwake !== undefined && !KEEP_AWAKE_MODES.includes(keepAwake)) {
+                fail(`--keep-awake must be one of: ${KEEP_AWAKE_MODES.join(', ')}`);
+            }
+            const saved = args.reset ? null : readServiceConfig();
+            let settings;
+            try {
+                settings = resolveServiceSettings({
+                    port: args.port === undefined ? undefined : parsePort(args.port),
+                    hostname: args.hostname,
+                    tunnelName: args['tunnel-name'],
+                    publicUrl: args['public-url'],
+                    localOnly: args['local-only'],
+                    keepAwake: keepAwake,
+                    openApp: args['no-open-app'] ? false : args['open-app'] ? true : undefined,
+                    serve,
+                }, saved);
+            }
+            catch (error) {
+                fail(errorMessage(error));
+            }
+            if (saved)
+                out('Reusing the saved settings; options you passed replace them.');
+            for (const line of describeSettings(settings))
+                out(line);
+            const cliFolder = protectedFolder(fileURLToPath(import.meta.url));
+            if (cliFolder) {
+                out(`Warning: this copy of chatgpt-desktop-mcp is inside ${cliFolder}, which macOS guards from background processes.`);
+                out('         The server cannot start until node is allowed there. A global npm install avoids this.');
+            }
+            const chatFolder = protectedFolder(settings.serve.workspaceRoot ?? defaultWorkspaceRoot());
+            if (chatFolder) {
+                out(`Note: new chats go in ${settings.serve.workspaceRoot ?? defaultWorkspaceRoot()}. macOS asks once whether node may access ${chatFolder}; click Allow.`);
+            }
+            const { agents } = await installService(settings, { overwriteDns: args['overwrite-dns'], skipZoneCheck: args['skip-zone-check'] });
             for (const agent of agents)
                 out(`loaded  ${agent}`);
-            const local = await waitForHealth(`http://127.0.0.1:${port}/healthz`, 30_000);
-            out(`${local ? 'ok  ' : 'FAIL'}  local   http://127.0.0.1:${port}/mcp`);
-            if (config.hostname) {
-                const remote = await waitForHealth(`https://${config.hostname}/healthz`, 60_000);
-                out(`${remote ? 'ok  ' : 'FAIL'}  public  https://${config.hostname}/mcp`);
+            const logs = logDirectory();
+            const local = await waitForHealth(`http://127.0.0.1:${settings.port}/healthz`, 30_000);
+            out(`${local ? 'ok  ' : 'FAIL'}  local   http://127.0.0.1:${settings.port}/mcp`);
+            if (!local)
+                out(`      See ${join(logs, 'server.log')}`);
+            if (!local && cliFolder)
+                out(`      The server is probably waiting for permission to read ${cliFolder}.`);
+            let remote = true;
+            const base = publicBaseUrl(settings);
+            if (base) {
+                remote = await waitForHealth(`${base}/healthz`, 60_000);
+                out(`${remote ? 'ok  ' : 'FAIL'}  public  ${base}/mcp`);
+                if (!remote && settings.hostname) {
+                    out('      A new DNS record can take a few minutes. If it still fails, the hostname may not be in the Cloudflare');
+                    out('      domain you picked at "cloudflared tunnel login": log in for that domain (or set TUNNEL_ORIGIN_CERT)');
+                    out(`      and run install again. Tunnel log: ${join(logs, 'tunnel.log')}`);
+                }
+                else if (!remote) {
+                    out(`      Check that your tunnel or proxy forwards ${base} to http://127.0.0.1:${settings.port}.`);
+                }
             }
-            out(`Logs: ${logDirectory()}`);
+            out(`Logs: ${logs}`);
             if (tokens.list().length === 0)
                 out('No access tokens yet. Create one for each agent with: chatgpt-desktop-mcp token create --name <agent>');
+            if (!local || !remote)
+                process.exitCode = 1;
             return;
         }
         case 'status': {
             const config = readServiceConfig();
             if (!config)
                 fail('The service is not installed. Run: chatgpt-desktop-mcp service install --hostname <host>');
+            for (const line of describeSettings(config))
+                out(line);
             for (const role of config.roles) {
                 const state = agentState(role);
                 // The watchdog and the app opener run briefly and exit, so "loaded" is their healthy state.
@@ -115,12 +189,24 @@ async function serviceCommand(subcommand, args, tokens) {
             }
             const check = await checkService(false);
             out(`${check.local ? 'ok  ' : 'FAIL'}  local   http://127.0.0.1:${config.port}/mcp`);
-            if (config.hostname) {
+            const base = publicBaseUrl(config);
+            if (base) {
                 const reason = check.public || check.internet !== false ? '' : ' (this Mac is offline)';
-                out(`${check.public ? 'ok  ' : 'FAIL'}  public  https://${config.hostname}/mcp${reason}`);
+                out(`${check.public ? 'ok  ' : 'FAIL'}  public  ${base}/mcp${reason}`);
             }
             out(`Logs: ${logDirectory()}`);
             out(`Tokens: ${tokens.list().length}`);
+            const access = readFolderAccess();
+            if (access && access.state !== 'ok') {
+                const what = access.state === 'denied' ? 'is blocked from' : 'is waiting for permission to read';
+                out(`Folders: the background server ${what} ${access.folder}.`);
+                out(`         Allow it in System Settings > Privacy & Security > Files and Folders, or add ${access.node} to Full Disk Access.`);
+            }
+            else if (access) {
+                out(`Folders: ${access.folder} is accessible`);
+            }
+            if (config.node)
+                out(`Node: ${config.node}`);
             if (!check.local || check.public === false)
                 process.exitCode = 1;
             return;
@@ -155,13 +241,19 @@ async function main() {
         allowPositionals: true,
         options: {
             host: { type: 'string', default: '127.0.0.1' },
-            port: { type: 'string', default: '8723' },
+            port: { type: 'string' },
             tunnel: { type: 'boolean', default: false },
             hostname: { type: 'string' },
             'tunnel-name': { type: 'string' },
-            'overwrite-dns': { type: 'boolean', default: false },
+            'public-url': { type: 'string' },
+            'local-only': { type: 'boolean', default: false },
+            'keep-awake': { type: 'string' },
             'no-keep-awake': { type: 'boolean', default: false },
+            'open-app': { type: 'boolean', default: false },
             'no-open-app': { type: 'boolean', default: false },
+            'overwrite-dns': { type: 'boolean', default: false },
+            'skip-zone-check': { type: 'boolean', default: false },
+            reset: { type: 'boolean', default: false },
             repair: { type: 'boolean', default: false },
             quiet: { type: 'boolean', default: false },
             'allow-origin': { type: 'string', multiple: true },
@@ -238,7 +330,16 @@ async function main() {
             break;
         }
         case 'service': {
-            await serviceCommand(subcommand, values, tokens);
+            // Paths are resolved here because launchd starts the server from /.
+            const codexBin = values['codex-bin'];
+            const serve = {
+                sandbox: values.sandbox,
+                approvalPolicy: values['approval-policy'],
+                workspaceRoot: values['workspace-root'] ? resolve(values['workspace-root']) : undefined,
+                codexBin: codexBin && codexBin.includes('/') ? resolve(codexBin) : codexBin,
+                allowOrigins: values['allow-origin'],
+            };
+            await serviceCommand(subcommand, values, serve, tokens);
             return;
         }
         case 'stdio': {
@@ -255,7 +356,7 @@ async function main() {
             return;
         }
         case 'serve': {
-            const port = parsePort(values.port);
+            const port = parsePort(values.port ?? String(DEFAULT_PORT));
             if (tokens.list().length === 0) {
                 if (process.stderr.isTTY) {
                     const { token, record } = tokens.create('default', 'control');
@@ -283,6 +384,18 @@ async function main() {
             }
             // Start the engine now so the first tool call is fast and setup problems show up immediately.
             runtime.reader.ensureStarted().catch((error) => log.error('could not start codex app-server', { message: errorMessage(error) }));
+            if (!process.stderr.isTTY) {
+                // In the background, macOS asks before node may read Documents and similar folders. Ask now, at
+                // login or install time, rather than when an agent first creates a chat there.
+                const chatRoot = values['workspace-root'] ? resolve(values['workspace-root']) : defaultWorkspaceRoot();
+                void watchFolderAccess(chatRoot, (state) => {
+                    void saveFolderAccess(folderAccessPath(), chatRoot, state, process.execPath);
+                    if (state === 'waiting')
+                        log.warn(`Waiting for macOS to let node read ${chatRoot}. Click Allow, or add ${process.execPath} to Full Disk Access.`);
+                    if (state === 'denied')
+                        log.warn(`macOS blocks node from ${chatRoot}. Allow it in System Settings > Privacy & Security, or add ${process.execPath} to Full Disk Access.`);
+                });
+            }
             const shutdown = () => {
                 stopTunnel?.();
                 runtime.shutdown();

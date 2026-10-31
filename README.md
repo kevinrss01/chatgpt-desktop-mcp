@@ -38,7 +38,7 @@ npm install -g https://github.com/kevinrss01/chatgpt-desktop-mcp/tarball/main
 chatgpt-desktop-mcp doctor
 ```
 
-The compiled CLI is committed in `dist/`, so installing from GitHub needs no build step. From a clone: `npm install && npm link`.
+The compiled CLI is committed in `dist/`, so installing from GitHub needs no build step. To pin a release, replace `main` with a tag such as `v0.2.0`. From a clone: `npm install && npm link`.
 
 ## Quick start
 
@@ -131,46 +131,97 @@ A typical monitoring loop: `list_chats` to see what changed, `get_chat_status` f
 A control token lets the holder make Codex run commands on your Mac with the permissions in your Codex configuration. Treat it like SSH access.
 
 - The server listens on `127.0.0.1` by default. Publish it through a TLS tunnel or reverse proxy; do not bind it to a public interface.
-- `serve --tunnel` starts a Cloudflare quick tunnel. Its URL is random and changes on every start, which suits testing. For a fixed address, use `service install --hostname` below, Tailscale Funnel, or your own proxy pointing at `http://127.0.0.1:8723`.
+- `serve --tunnel` starts a Cloudflare quick tunnel. Its URL is random and changes on every start, which suits testing. For a fixed address on your own domain, use `service install` below.
 - Give monitoring agents `read` tokens. Revoke tokens you no longer use.
 - Requests carrying a browser `Origin` header are rejected unless allowed with `--allow-origin`, which also enables CORS for that origin. Repeated failed authentication from one client returns 429.
 - To restrict chats the bridge starts or resumes, run with `--sandbox workspace-write --approval-policy on-request` and answer approvals with `respond_to_request`. Callers cannot loosen these settings through tool arguments. Chats open in the app keep the app's own settings.
 
-## Keep it running with a fixed URL
+## Keep it running on your own URL
 
-`service install` sets up macOS LaunchAgents so the server and a named Cloudflare tunnel start at login and restart when they exit. The public URL stays the same across restarts, network changes, and reinstalls.
+`service install` keeps the server running in the background with macOS LaunchAgents. It starts at login, restarts after a crash, and a watchdog checks it every two minutes. Choose how other agents reach it:
+
+| Setup | Command | What you need |
+| --- | --- | --- |
+| Your own domain through Cloudflare (recommended) | `service install --hostname mcp.yourdomain.com` | A domain on Cloudflare (the free plan works) and `cloudflared` |
+| Your own tunnel or proxy | `service install --public-url https://your-url` | Tailscale Funnel, ngrok, Caddy, nginx, or anything that forwards HTTPS to `http://127.0.0.1:8723` |
+| This Mac only | `service install` | Nothing else; local clients use `http://127.0.0.1:8723/mcp` |
+
+Then create a token for each agent with `chatgpt-desktop-mcp token create --name <agent>` and check everything with `chatgpt-desktop-mcp service status`.
+
+### Your own domain through Cloudflare
 
 ```sh
-cloudflared tunnel login        # once, pick the zone that will hold the hostname
-chatgpt-desktop-mcp service install --hostname mcp.example.com
+brew install cloudflared
+cloudflared tunnel login        # pick the domain that will hold the hostname
+chatgpt-desktop-mcp service install --hostname mcp.yourdomain.com
 chatgpt-desktop-mcp token create --name my-agent
-chatgpt-desktop-mcp service status
 ```
 
-Agents then connect to `https://mcp.example.com/mcp`. Install creates the tunnel (default name `chatgpt-desktop-mcp`) and a DNS record for the hostname, and refuses to replace an existing record unless you pass `--overwrite-dns`. The tunnel forwards only that hostname to `http://127.0.0.1:8723`.
+Agents connect to `https://mcp.yourdomain.com/mcp`. Install creates a named tunnel in your Cloudflare account (`chatgpt-desktop-mcp` unless you pass `--tunnel-name`), adds a DNS record for the hostname, and forwards only that hostname to the local server. It stops before touching DNS if the domain does not use Cloudflare nameservers, and it never replaces an existing record unless you pass `--overwrite-dns`.
 
-It loads these agents in `~/Library/LaunchAgents`, with logs in `~/Library/Logs/chatgpt-desktop-mcp`:
+The certificate from `cloudflared tunnel login` covers one domain. If you have several, log in again for the domain you want or set `TUNNEL_ORIGIN_CERT=/path/to/cert.pem` before running install.
+
+### Your own tunnel or proxy
+
+Run your tunnel so it forwards to `http://127.0.0.1:8723`, then tell the service its URL. With Tailscale Funnel, for example:
+
+```sh
+tailscale funnel --bg 8723
+chatgpt-desktop-mcp service install --public-url https://my-mac.your-tailnet.ts.net
+```
+
+The service keeps the MCP server running and checks the public URL, so `service status` shows when it is down. Keeping the tunnel or proxy itself running is up to that tool.
+
+### Options
+
+Install saves its settings in `~/.config/chatgpt-desktop-mcp/service.json`. Running `service install` again, for example after upgrading Node or this package, reuses them; any option you pass replaces the saved value.
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `--hostname <host>` | none | Publish on your domain through a named Cloudflare tunnel. |
+| `--tunnel-name <name>` | `chatgpt-desktop-mcp` | Cloudflare tunnel to create or reuse. |
+| `--overwrite-dns` | off | Replace an existing DNS record for the hostname. |
+| `--skip-zone-check` | off | Skip the check that the domain uses Cloudflare DNS. |
+| `--public-url <url>` | none | Use a tunnel or proxy you run yourself. The service monitors it. |
+| `--local-only` | | Remove the saved hostname or public URL. |
+| `--port <number>` | `8723` | Local port. |
+| `--keep-awake <mode>` | `ac` | `ac` blocks idle sleep on AC power, `always` also on battery, `off` leaves sleep to macOS. |
+| `--open-app`, `--no-open-app` | open | Open the ChatGPT app in the background at login. |
+| `--sandbox`, `--approval-policy`, `--workspace-root`, `--codex-bin`, `--allow-origin` | your Codex settings | Passed to the background server, as with `serve`. |
+| `--reset` | | Ignore the saved settings and start from the defaults. |
+
+If you set `CHATGPT_DESKTOP_MCP_CONFIG_DIR`, `CODEX_HOME`, or `CHATGPT_DESKTOP_MCP_CODEX_BIN` when running install, the background agents use the same values. Each macOS user can run one service.
+
+### What runs in the background
+
+LaunchAgents live in `~/Library/LaunchAgents` and write logs to `~/Library/Logs/chatgpt-desktop-mcp`:
 
 | Agent | What it does |
 | --- | --- |
 | `server` | Runs `serve` on 127.0.0.1 and restarts it if it exits. |
-| `tunnel` | Runs the named tunnel. `cloudflared` reconnects by itself after network drops. |
+| `tunnel` | With `--hostname`, runs the named tunnel. `cloudflared` reconnects by itself after network drops. |
 | `watchdog` | Every 2 minutes, restarts the server if `/healthz` stops answering, and restarts the tunnel if the public URL fails twice in a row while the Mac is online. |
-| `keepawake` | Runs `caffeinate -s`, which stops the Mac from sleeping while it is on AC power. Skip with `--no-keep-awake`. |
-| `openapp` | Opens the ChatGPT app in the background at login so open chats can be controlled live. Skip with `--no-open-app`. |
+| `keepawake` | Runs `caffeinate` according to `--keep-awake`. |
+| `openapp` | Opens the ChatGPT app in the background at login so open chats can be controlled live. |
 
-Run `service install` again after upgrading Node or this package. `service uninstall` removes the agents and keeps the tunnel and DNS record; delete those with `cloudflared tunnel delete <name>` and the Cloudflare dashboard.
+`service uninstall` removes the agents and keeps the Cloudflare tunnel and DNS record; delete those with `cloudflared tunnel delete <name>` and the Cloudflare dashboard.
 
-What this covers and what it cannot:
+### macOS folder permissions
 
-- **Network drops and Wi‑Fi changes:** covered. The tunnel reconnects and the URL does not change.
-- **Crashes:** covered. launchd restarts the server and tunnel within about 10 seconds, and the watchdog catches a process that hangs.
+macOS asks before a background process reads Documents, Desktop, Downloads, iCloud Drive, or external drives. New chats go in `~/Documents/Codex` by default, and your projects may live in those folders, so the background server checks access when it starts and macOS shows a prompt for `node`. Click **Allow**. To cover every folder at once, add the node binary shown by `service status` to System Settings › Privacy & Security › Full Disk Access. Upgrading Node can reset this permission.
+
+`service status` reports whether the server can read the chat folder. Install the package itself outside those folders, as a global npm install does; a copy inside Documents cannot start in the background until `node` is allowed there.
+
+### What it survives
+
+- **Network drops and Wi‑Fi changes:** the tunnel reconnects and the URL does not change.
+- **Crashes and hangs:** launchd restarts the server and tunnel within about 10 seconds, and the watchdog restarts a process that stops answering.
 - **Restart or shutdown:** everything starts again once you log in. With FileVault on, macOS waits for your password at boot, so the URL is down until then. To power back on after a power cut, run `sudo pmset -a autorestart 1`.
-- **Sleep:** a sleeping Mac cannot answer. `keepawake` prevents idle sleep on AC power only.
+- **Sleep:** a sleeping Mac cannot answer. `--keep-awake` prevents idle sleep; on battery only with `always`.
 - **Closing the lid:** the Mac sleeps unless it is in clamshell mode (power plus an external display). `sudo pmset -a disablesleep 1` keeps it awake with the lid closed; undo with `sudo pmset -a disablesleep 0`. A closed, awake laptop runs warm, so do not put it in a bag.
 - **The ChatGPT app:** listing, reading, and new chats work without it. Live control of chats open in a window needs the app running.
 
-For an address that stays up even when the Mac is off, run the bridge on an always-on Mac (a Mac mini, for example) and connect the other agents there.
+For an address that stays up while your laptop is off, run the bridge on an always-on Mac, such as a Mac mini, and point your agents there.
 
 ## Limitations
 
