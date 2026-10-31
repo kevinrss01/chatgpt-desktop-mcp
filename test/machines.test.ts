@@ -17,6 +17,10 @@ function fakeBridge(label: string): DesktopBridge {
     listModels: async () => [{ id: `model-${label}` }],
     listChats: async () => ({ chats: [{ id: `${label}-chat`, updatedAt: label === 'mini' ? '2026-10-31T10:00:00.000Z' : '2026-10-30T10:00:00.000Z' }], nextCursor: null }),
     listPendingRequests: () => [],
+    getChatStatus: async (chatId: string) => {
+      if (!chatId.startsWith(label)) throw new Error(`thread not loaded: ${chatId}`);
+      return { chatId, running: false };
+    },
     createChat: async (params: { prompt?: string }) => ({ chatId: `${label}-new`, turnId: 't1', prompt: params.prompt }),
     // The first wait times out so the hub has to wait again.
     waitForChat: async (chatId: string) => ({ chatId, running: waits === 0, timedOut: waits++ === 0 }),
@@ -97,6 +101,8 @@ describe('machine routing', () => {
     const offline = await call(client, 'list_models', { machine: 'gone' });
     expect(offline.isError).toBe(true);
     expect(offline.value).toMatch(/^gone: not reachable/);
+    const elsewhere = await call(client, 'get_chat_status', { chatId: 'mini-new' });
+    expect(elsewhere.value).toContain('pass machine');
     await client.close();
   });
 

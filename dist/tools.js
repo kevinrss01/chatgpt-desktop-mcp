@@ -121,8 +121,18 @@ export function createMcpServer(bridge, scope, version, router) {
                 if (options.all && requested === 'all')
                     return ok(await gatherAll(name, args, options.all, handler));
                 const target = await router.resolve(requested, options.control);
-                if (target.kind === 'local')
-                    return ok(withMachine(await handler(args), target.name));
+                if (target.kind === 'local') {
+                    try {
+                        return ok(withMachine(await handler(args), target.name));
+                    }
+                    catch (error) {
+                        // A chat id from another Mac is unknown here; tell the agent how to reach it.
+                        if (typeof args.chatId === 'string' && /not loaded|not found|no rollout|unknown (thread|chat)/i.test(errorMessage(error))) {
+                            throw new BridgeError(`${errorMessage(error)}. This chat is not on ${target.name}; if it lives on another Mac, pass machine (see list_machines).`, { cause: error });
+                        }
+                        throw error;
+                    }
+                }
                 try {
                     return ok(withMachine(await forward(name, target, args), target.name));
                 }
