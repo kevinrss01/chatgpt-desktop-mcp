@@ -1,12 +1,15 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { log } from './log.js';
-import { BridgeError, errorMessage } from './util.js';
+import { describeMachineError } from './machines.js';
+import { BridgeError, errorMessage, isRecord } from './util.js';
 export const SERVER_NAME = 'chatgpt-desktop-mcp';
 const INSTRUCTIONS = `Controls Codex chats in the ChatGPT desktop app on the user's Mac.
 Chats open in an app window are driven live through the app; other chats run in a background Codex engine that shares the app's history.
 Typical flow: list_chats or create_chat, then send_message, then wait_for_chat and read_chat.
 Use list_models to discover valid model, reasoning effort, and speed values.`;
+const MACHINE_INSTRUCTIONS = (localName) => `
+This server reaches several Macs. Call list_machines to see which are available, then pass machine to any tool. Omit machine to use this Mac ("${localName}"), or pass "auto" for the first available Mac. list_chats and list_pending_requests also accept "all".`;
 function ok(value) {
     return { content: [{ type: 'text', text: JSON.stringify(value, null, 2) }] };
 }
@@ -14,16 +17,50 @@ function fail(error) {
     const message = error instanceof BridgeError ? error.message : `Error: ${errorMessage(error)}`;
     return { content: [{ type: 'text', text: message }], isError: true };
 }
-function wrap(name, handler) {
-    return async (args) => {
-        try {
-            return ok(await handler(args));
-        }
-        catch (error) {
-            log.warn('tool failed', { tool: name, message: errorMessage(error) });
-            return fail(error);
-        }
-    };
+function withMachine(value, machine) {
+    return isRecord(value) ? { machine, ...value } : value;
+}
+/** Turns a forwarded tool result back into a value, or throws the remote error. */
+function remoteValue(result, machine) {
+    const text = result.content
+        .filter((part) => part.type === 'text')
+        .map((part) => (part.type === 'text' ? part.text : ''))
+        .join('\n');
+    if (result.isError)
+        throw new BridgeError(`${machine}: ${text.replace(/^Error: /, '')}`);
+    try {
+        return JSON.parse(text);
+    }
+    catch {
+        return { text };
+    }
+}
+const REMOTE_WAIT_CHUNK_SECONDS = 60;
+/** Waits on a remote chat in short calls, so tunnels and proxies with request time limits do not cut the wait. */
+async function waitRemote(target, chatId, seconds) {
+    const deadline = Date.now() + seconds * 1000;
+    for (;;) {
+        const chunk = Math.max(1, Math.min(REMOTE_WAIT_CHUNK_SECONDS, Math.ceil((deadline - Date.now()) / 1000)));
+        const value = remoteValue(await target.remote.callTool('wait_for_chat', { chatId, timeoutSeconds: chunk }, (chunk + 60) * 1000), target.name);
+        if (!isRecord(value) || value.timedOut !== true || Date.now() >= deadline)
+            return value;
+    }
+}
+async function forward(name, target, args) {
+    if (name === 'wait_for_chat') {
+        const seconds = typeof args.timeoutSeconds === 'number' ? args.timeoutSeconds : 60;
+        return waitRemote(target, String(args.chatId), seconds);
+    }
+    if ((name === 'create_chat' || name === 'send_message') && args.wait === true) {
+        const { wait: _wait, waitSeconds, ...rest } = args;
+        const sent = remoteValue(await target.remote.callTool(name, rest), target.name);
+        const chatId = name === 'send_message' ? String(args.chatId) : isRecord(sent) && typeof sent.chatId === 'string' ? sent.chatId : null;
+        const started = name === 'send_message' || (isRecord(sent) && typeof sent.turnId === 'string');
+        if (!chatId || !started || !isRecord(sent))
+            return sent;
+        return { ...sent, result: await waitRemote(target, chatId, typeof waitSeconds === 'number' ? waitSeconds : 60) };
+    }
+    return remoteValue(await target.remote.callTool(name, args), target.name);
 }
 const chatId = z.string().min(1).describe('Chat id from list_chats or create_chat.');
 const turnOptions = {
@@ -34,21 +71,104 @@ const turnOptions = {
         .optional()
         .describe('Speed tier from list_models, for example "standard", "fast" (priority), or "ultrafast" when the model offers it.'),
 };
-export function createMcpServer(bridge, scope, version) {
-    const server = new McpServer({ name: SERVER_NAME, version }, { instructions: INSTRUCTIONS });
+export function createMcpServer(bridge, scope, version, router) {
+    const routed = router?.hasMachines() ?? false;
+    const localName = router?.localName() ?? null;
+    const instructions = routed && localName ? INSTRUCTIONS + MACHINE_INSTRUCTIONS(localName) : INSTRUCTIONS;
+    const server = new McpServer({ name: SERVER_NAME, version }, { instructions });
     const readOnly = { readOnlyHint: true, openWorldHint: false };
-    server.registerTool('list_models', {
+    const gatherAll = async (name, args, field, handler) => {
+        if (args.cursor !== undefined)
+            throw new BridgeError('cursor cannot be combined with machine "all". Page through one machine at a time.');
+        const targets = router?.targets() ?? [];
+        const results = await Promise.all(targets.map(async (target) => {
+            try {
+                const value = target.kind === 'local' ? await handler(args) : remoteValue(await target.remote.callTool(name, args, 30_000), target.name);
+                return { machine: target.name, ok: true, value };
+            }
+            catch (error) {
+                return { machine: target.name, ok: false, error: describeMachineError(error) };
+            }
+        }));
+        let items = results.flatMap((result) => result.ok && isRecord(result.value) && Array.isArray(result.value[field])
+            ? result.value[field].map((item) => withMachine(item, result.machine))
+            : []);
+        if (field === 'chats') {
+            const updated = (item) => (isRecord(item) && typeof item.updatedAt === 'string' ? item.updatedAt : '');
+            items = items.sort((a, b) => updated(b).localeCompare(updated(a))).slice(0, typeof args.limit === 'number' ? args.limit : 20);
+        }
+        return {
+            machines: results.map((result) => result.ok
+                ? { machine: result.machine, ok: true, nextCursor: isRecord(result.value) ? (result.value.nextCursor ?? null) : null }
+                : { machine: result.machine, ok: false, error: result.error }),
+            [field]: items,
+        };
+    };
+    /** Registers a tool that runs here, or on the machine named in its machine argument. */
+    const register = (name, config, options, typedHandler) => {
+        const handler = (args) => typedHandler(args);
+        const machineArgument = z
+            .string()
+            .optional()
+            .describe(`Machine from list_machines. Omit for this Mac (${localName}); "auto" picks the first available Mac${options.all ? '; "all" lists every Mac' : ''}.`);
+        const inputSchema = routed ? { ...(config.inputSchema ?? {}), machine: machineArgument } : { ...(config.inputSchema ?? {}) };
+        const run = async (rawArgs) => {
+            try {
+                if (!routed || !router)
+                    return ok(await handler(rawArgs));
+                const { machine, ...args } = rawArgs;
+                const requested = typeof machine === 'string' ? machine.trim().toLowerCase() : undefined;
+                if (options.all && requested === 'all')
+                    return ok(await gatherAll(name, args, options.all, handler));
+                const target = await router.resolve(requested, options.control);
+                if (target.kind === 'local')
+                    return ok(withMachine(await handler(args), target.name));
+                try {
+                    return ok(withMachine(await forward(name, target, args), target.name));
+                }
+                catch (error) {
+                    if (error instanceof BridgeError)
+                        throw error;
+                    throw new BridgeError(`${target.name}: ${describeMachineError(error)}`, { cause: error });
+                }
+            }
+            catch (error) {
+                log.warn('tool failed', { tool: name, message: errorMessage(error) });
+                return fail(error);
+            }
+        };
+        // The schema is built at runtime, so the handler receives plain validated arguments.
+        server.registerTool(name, { ...config, inputSchema }, run);
+    };
+    if (router) {
+        server.registerTool('list_machines', {
+            title: 'List machines',
+            description: 'Lists the Macs this server can control, in the order machine "auto" tries them, with whether each is reachable, its access level, and whether its ChatGPT app is open for live control.',
+            inputSchema: { includeOthers: z.boolean().optional().describe('Default true. False reports only this Mac.') },
+            annotations: readOnly,
+        }, async ({ includeOthers }) => {
+            try {
+                if (includeOthers === false)
+                    return ok({ machines: [router.localStatus(scope)] });
+                return ok({ thisMachine: router.localName(), machines: await router.statuses(scope) });
+            }
+            catch (error) {
+                return fail(error);
+            }
+        });
+    }
+    register('list_models', {
         title: 'List models',
         description: 'Lists models available to the ChatGPT app, with supported reasoning efforts and speed tiers.',
         inputSchema: { refresh: z.boolean().optional().describe('Bypass the five-minute cache.') },
         annotations: readOnly,
-    }, wrap('list_models', async ({ refresh }) => ({ models: await bridge.listModels(refresh ?? false) })));
-    server.registerTool('list_projects', {
+    }, { control: false }, async ({ refresh }) => ({ models: await bridge.listModels(refresh ?? false) }));
+    register('list_projects', {
         title: 'List projects',
         description: 'Lists projects saved in the ChatGPT app and folders used by recent chats.',
         annotations: readOnly,
-    }, wrap('list_projects', async () => bridge.listProjects()));
-    server.registerTool('list_chats', {
+    }, { control: false }, async () => bridge.listProjects());
+    register('list_chats', {
         title: 'List chats',
         description: 'Lists Codex chats, most recently updated first.',
         inputSchema: {
@@ -60,8 +180,8 @@ export function createMcpServer(bridge, scope, version) {
             includeBackground: z.boolean().optional().describe('Also include exec runs and sub-agent chats.'),
         },
         annotations: readOnly,
-    }, wrap('list_chats', async (args) => bridge.listChats(args)));
-    server.registerTool('read_chat', {
+    }, { control: false, all: 'chats' }, async (args) => bridge.listChats(args));
+    register('read_chat', {
         title: 'Read chat',
         description: 'Reads the latest turns of a chat in chronological order. Use olderCursor to page back.',
         inputSchema: {
@@ -74,14 +194,14 @@ export function createMcpServer(bridge, scope, version) {
             maxCharsPerItem: z.number().int().min(200).max(50000).optional().describe('Default 4000.'),
         },
         annotations: readOnly,
-    }, wrap('read_chat', async (args) => bridge.readChat(args)));
-    server.registerTool('get_chat_status', {
+    }, { control: false }, async (args) => bridge.readChat(args));
+    register('get_chat_status', {
         title: 'Get chat status',
         description: 'Reports whether a chat is running, where it runs (app window, bridge, or stored only), its current model settings, pending approvals, and the latest assistant message.',
         inputSchema: { chatId },
         annotations: readOnly,
-    }, wrap('get_chat_status', async ({ chatId: id }) => bridge.getChatStatus(id)));
-    server.registerTool('wait_for_chat', {
+    }, { control: false }, async ({ chatId: id }) => bridge.getChatStatus(id));
+    register('wait_for_chat', {
         title: 'Wait for chat',
         description: 'Waits until the chat stops running or the timeout passes, then returns its status and latest assistant message.',
         inputSchema: {
@@ -89,16 +209,16 @@ export function createMcpServer(bridge, scope, version) {
             timeoutSeconds: z.number().int().min(1).max(300).optional().describe('Default 60. Call again if timedOut is true.'),
         },
         annotations: readOnly,
-    }, wrap('wait_for_chat', async ({ chatId: id, timeoutSeconds }) => bridge.waitForChat(id, (timeoutSeconds ?? 60) * 1000)));
-    server.registerTool('list_pending_requests', {
+    }, { control: false }, async ({ chatId: id, timeoutSeconds }) => bridge.waitForChat(id, (timeoutSeconds ?? 60) * 1000));
+    register('list_pending_requests', {
         title: 'List pending requests',
         description: 'Lists approvals and questions waiting for an answer in chats run by this bridge.',
         inputSchema: { chatId: chatId.optional() },
         annotations: readOnly,
-    }, wrap('list_pending_requests', async ({ chatId: id }) => ({ requests: bridge.listPendingRequests(id) })));
+    }, { control: false, all: 'requests' }, async ({ chatId: id }) => ({ requests: bridge.listPendingRequests(id) }));
     if (scope !== 'control')
         return server;
-    server.registerTool('create_chat', {
+    register('create_chat', {
         title: 'Create chat',
         description: 'Creates a Codex chat that appears in the ChatGPT app. With a prompt it starts working immediately. Without a project, a new folder is created under the workspace root, like the app does.',
         inputSchema: {
@@ -112,13 +232,13 @@ export function createMcpServer(bridge, scope, version) {
             waitSeconds: z.number().int().min(1).max(300).optional().describe('Default 60.'),
         },
         annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
-    }, wrap('create_chat', async ({ wait, waitSeconds, ...params }) => {
+    }, { control: true }, async ({ wait, waitSeconds, ...params }) => {
         const created = await bridge.createChat(params);
         if (!wait || !created.turnId)
             return created;
         return { ...created, result: await bridge.waitForChat(created.chatId, (waitSeconds ?? 60) * 1000) };
-    }));
-    server.registerTool('send_message', {
+    });
+    register('send_message', {
         title: 'Send message',
         description: 'Sends a message to an existing chat. If the chat is open in the ChatGPT app, it is sent through the app and appears live there.',
         inputSchema: {
@@ -133,31 +253,31 @@ export function createMcpServer(bridge, scope, version) {
             waitSeconds: z.number().int().min(1).max(300).optional().describe('Default 60.'),
         },
         annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
-    }, wrap('send_message', async ({ wait, waitSeconds, ...params }) => {
+    }, { control: true }, async ({ wait, waitSeconds, ...params }) => {
         const sent = await bridge.sendMessage(params);
         if (!wait)
             return sent;
         return { ...sent, result: await bridge.waitForChat(params.chatId, (waitSeconds ?? 60) * 1000) };
-    }));
-    server.registerTool('interrupt_chat', {
+    });
+    register('interrupt_chat', {
         title: 'Interrupt chat',
         description: 'Stops the running turn of a chat.',
         inputSchema: { chatId },
         annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
-    }, wrap('interrupt_chat', async ({ chatId: id }) => bridge.interruptChat(id)));
-    server.registerTool('rename_chat', {
+    }, { control: true }, async ({ chatId: id }) => bridge.interruptChat(id));
+    register('rename_chat', {
         title: 'Rename chat',
         description: 'Sets the title of a chat.',
         inputSchema: { chatId, title: z.string().min(1).max(200) },
         annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-    }, wrap('rename_chat', async ({ chatId: id, title }) => bridge.renameChat(id, title)));
-    server.registerTool('archive_chat', {
+    }, { control: true }, async ({ chatId: id, title }) => bridge.renameChat(id, title));
+    register('archive_chat', {
         title: 'Archive chat',
         description: 'Archives a chat, or restores it with archived=false.',
         inputSchema: { chatId, archived: z.boolean().optional().describe('Default true.') },
         annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-    }, wrap('archive_chat', async ({ chatId: id, archived }) => bridge.archiveChat(id, archived ?? true)));
-    server.registerTool('respond_to_request', {
+    }, { control: true }, async ({ chatId: id, archived }) => bridge.archiveChat(id, archived ?? true));
+    register('respond_to_request', {
         title: 'Respond to request',
         description: 'Answers an approval or question from list_pending_requests.',
         inputSchema: {
@@ -170,6 +290,6 @@ export function createMcpServer(bridge, scope, version) {
             content: z.record(z.string(), z.unknown()).optional().describe('For MCP elicitations accepted with "accept".'),
         },
         annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
-    }, wrap('respond_to_request', async ({ requestId, answer, answers, content }) => bridge.respondToRequest(requestId, answer, answers, content)));
+    }, { control: true }, async ({ requestId, answer, answers, content }) => bridge.respondToRequest(requestId, answer, answers, content));
     return server;
 }

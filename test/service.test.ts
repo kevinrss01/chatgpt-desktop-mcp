@@ -16,6 +16,7 @@ const saved: ServiceSettings = {
   port: 9000,
   hostname: 'mcp.example.com',
   tunnelName: 'my-tunnel',
+  tunnelCredentials: null,
   publicUrl: null,
   keepAwake: 'always',
   openApp: false,
@@ -28,6 +29,7 @@ describe('resolveServiceSettings', () => {
       port: 8723,
       hostname: null,
       tunnelName: null,
+      tunnelCredentials: null,
       publicUrl: null,
       keepAwake: 'ac',
       openApp: true,
@@ -61,6 +63,15 @@ describe('resolveServiceSettings', () => {
     expect(() => resolveServiceSettings({ hostname: 'https://mcp.example.com' }, null)).toThrow(/--public-url/);
     expect(() => resolveServiceSettings({ port: 0 }, null)).toThrow(/--port/);
     expect(() => normalizePublicUrl('ftp://example.com')).toThrow(/https/);
+  });
+
+  it('runs a tunnel created on another Mac from its credentials file', () => {
+    const imported = resolveServiceSettings({ hostname: 'mini.example.com', tunnelCredentials: '/tmp/abc.json' }, null);
+    expect(imported).toMatchObject({ hostname: 'mini.example.com', tunnelName: null, tunnelCredentials: '/tmp/abc.json' });
+    expect(resolveServiceSettings({}, imported)).toEqual(imported);
+    expect(resolveServiceSettings({ tunnelName: 'own' }, imported)).toMatchObject({ tunnelName: 'own', tunnelCredentials: null });
+    expect(resolveServiceSettings({ publicUrl: 'https://x.example.com' }, imported).tunnelCredentials).toBeNull();
+    expect(() => resolveServiceSettings({ tunnelCredentials: '/tmp/abc.json' }, null)).toThrow(/needs --hostname/);
   });
 });
 

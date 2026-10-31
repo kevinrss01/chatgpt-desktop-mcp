@@ -35,6 +35,8 @@ export interface ServiceSettings {
   /** Hostname published through a named Cloudflare tunnel that the service runs. */
   hostname: string | null;
   tunnelName: string | null;
+  /** Credentials file of a tunnel created on another Mac; DNS for the hostname is managed there. */
+  tunnelCredentials: string | null;
   /** Base URL of a tunnel or proxy you run yourself. The service only monitors it. */
   publicUrl: string | null;
   keepAwake: KeepAwake;
@@ -55,6 +57,7 @@ export interface SettingsInput {
   port?: number;
   hostname?: string;
   tunnelName?: string;
+  tunnelCredentials?: string;
   publicUrl?: string;
   localOnly?: boolean;
   keepAwake?: KeepAwake;
@@ -174,14 +177,19 @@ export function resolveServiceSettings(input: SettingsInput, saved: ServiceSetti
 
   let hostname = base?.hostname ?? null;
   let tunnelName = base?.tunnelName ?? null;
+  let tunnelCredentials = base?.tunnelCredentials ?? null;
   let publicUrl = base?.publicUrl ?? null;
   if (input.localOnly) {
     hostname = null;
     tunnelName = null;
+    tunnelCredentials = null;
     publicUrl = null;
   }
   if (input.hostname !== undefined) {
-    if (!hostname) tunnelName = null;
+    if (!hostname) {
+      tunnelName = null;
+      tunnelCredentials = null;
+    }
     hostname = normalizeHostname(input.hostname);
     publicUrl = null;
   }
@@ -189,13 +197,21 @@ export function resolveServiceSettings(input: SettingsInput, saved: ServiceSetti
     publicUrl = normalizePublicUrl(input.publicUrl);
     hostname = null;
     tunnelName = null;
+    tunnelCredentials = null;
+  }
+  if (input.tunnelCredentials !== undefined) {
+    if (!hostname) throw new Error('--tunnel-credentials needs --hostname.');
+    if (input.tunnelName !== undefined) throw new Error('Use either --tunnel-name or --tunnel-credentials.');
+    tunnelCredentials = input.tunnelCredentials;
+    tunnelName = null;
   }
   if (input.tunnelName !== undefined) {
     if (!hostname) throw new Error('--tunnel-name needs --hostname.');
     if (!TUNNEL_NAME.test(input.tunnelName)) throw new Error('--tunnel-name may contain letters, digits, ".", "_", and "-" (up to 63 characters).');
     tunnelName = input.tunnelName;
+    tunnelCredentials = null;
   }
-  if (hostname && !tunnelName) tunnelName = DEFAULT_TUNNEL_NAME;
+  if (hostname && !tunnelName && !tunnelCredentials) tunnelName = DEFAULT_TUNNEL_NAME;
 
   const port = input.port ?? base?.port ?? DEFAULT_PORT;
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('--port must be a number between 1 and 65535');
@@ -203,6 +219,7 @@ export function resolveServiceSettings(input: SettingsInput, saved: ServiceSetti
     port,
     hostname,
     tunnelName,
+    tunnelCredentials,
     publicUrl,
     keepAwake: input.keepAwake ?? base?.keepAwake ?? 'ac',
     openApp: input.openApp ?? base?.openApp ?? true,
@@ -342,6 +359,7 @@ export function readServiceConfig(): ServiceConfig | null {
     port: parsed.port,
     hostname: typeof parsed.hostname === 'string' ? parsed.hostname : null,
     tunnelName: typeof parsed.tunnelName === 'string' ? parsed.tunnelName : null,
+    tunnelCredentials: typeof parsed.tunnelCredentials === 'string' ? parsed.tunnelCredentials : null,
     tunnelId: typeof parsed.tunnelId === 'string' ? parsed.tunnelId : null,
     node: typeof parsed.node === 'string' ? parsed.node : null,
     publicUrl: typeof parsed.publicUrl === 'string' ? parsed.publicUrl : null,
@@ -450,6 +468,29 @@ function tunnelCredentials(tunnelId: string, certificate: string): string {
   return found;
 }
 
+/**
+ * Copies the credentials of a tunnel created elsewhere into the config folder.
+ * This Mac then runs the tunnel without a Cloudflare login.
+ */
+export function importTunnelCredentials(file: string): { tunnelId: string; path: string } {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(file, 'utf8'));
+  } catch (error) {
+    throw new Error(`Could not read tunnel credentials from ${file}: ${errorMessage(error)}`);
+  }
+  if (!isRecord(parsed) || typeof parsed.TunnelID !== 'string' || typeof parsed.AccountTag !== 'string' || typeof parsed.TunnelSecret !== 'string') {
+    throw new Error(`${file} is not a tunnel credentials file. It is the <tunnel-id>.json that "cloudflared tunnel create" writes.`);
+  }
+  if (!/^[0-9a-f-]{36}$/i.test(parsed.TunnelID)) throw new Error(`${file} has an invalid TunnelID.`);
+  const path = join(configDir(), `tunnel-${parsed.TunnelID}.json`);
+  if (file !== path) {
+    mkdirSync(configDir(), { recursive: true, mode: 0o700 });
+    writeFileSync(path, `${JSON.stringify({ AccountTag: parsed.AccountTag, TunnelSecret: parsed.TunnelSecret, TunnelID: parsed.TunnelID })}\n`, { mode: 0o600 });
+  }
+  return { tunnelId: parsed.TunnelID, path };
+}
+
 /** Environment for the agents, so they use the same config folder and Codex home as the install command. */
 function agentEnvironment(node: string): Record<string, string> {
   const path = [dirname(node), '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin'];
@@ -461,8 +502,9 @@ function agentEnvironment(node: string): Record<string, string> {
   return env;
 }
 
-export async function installService(settings: ServiceSettings, options: InstallOptions = {}): Promise<{ config: ServiceConfig; agents: string[] }> {
+export async function installService(requested: ServiceSettings, options: InstallOptions = {}): Promise<{ config: ServiceConfig; agents: string[] }> {
   if (process.platform !== 'darwin') throw new Error('The service command manages macOS LaunchAgents.');
+  let settings = requested;
   const node = options.nodePath ?? findExecutable('node') ?? process.execPath;
   const cli = fileURLToPath(new URL('./cli.js', import.meta.url));
   const logs = logDirectory();
@@ -481,16 +523,27 @@ export async function installService(settings: ServiceSettings, options: Install
   });
 
   let tunnelId: string | null = null;
-  if (settings.hostname && settings.tunnelName) {
+  if (settings.hostname && (settings.tunnelName || settings.tunnelCredentials)) {
     const cloudflared = findExecutable('cloudflared');
     if (!cloudflared) throw new Error('cloudflared is not installed. Install it with: brew install cloudflared');
-    const certificate = originCertificate();
-    if (!certificate) throw new Error('Cloudflare is not logged in on this Mac. Run: cloudflared tunnel login');
-    if (!options.skipZoneCheck) await assertHostnameZone(settings.hostname, certificate);
-    tunnelId = ensureTunnel(cloudflared, settings.tunnelName);
-    routeHostname(cloudflared, tunnelId, settings.hostname, options.overwriteDns ?? false);
+    let credentials: string;
+    if (settings.tunnelCredentials) {
+      const imported = importTunnelCredentials(settings.tunnelCredentials);
+      tunnelId = imported.tunnelId;
+      credentials = imported.path;
+      settings = { ...settings, tunnelCredentials: imported.path };
+    } else {
+      const certificate = originCertificate();
+      if (!certificate) {
+        throw new Error('Cloudflare is not logged in on this Mac. Run "cloudflared tunnel login", or use --tunnel-credentials with a tunnel created on another Mac.');
+      }
+      if (!options.skipZoneCheck) await assertHostnameZone(settings.hostname, certificate);
+      tunnelId = ensureTunnel(cloudflared, settings.tunnelName ?? DEFAULT_TUNNEL_NAME);
+      routeHostname(cloudflared, tunnelId, settings.hostname, options.overwriteDns ?? false);
+      credentials = tunnelCredentials(tunnelId, certificate);
+    }
     const tunnelConfig = join(configDir(), 'cloudflared.yml');
-    writeFileSync(tunnelConfig, renderTunnelConfig(tunnelId, tunnelCredentials(tunnelId, certificate), settings.port, settings.hostname), { mode: 0o600 });
+    writeFileSync(tunnelConfig, renderTunnelConfig(tunnelId, credentials, settings.port, settings.hostname), { mode: 0o600 });
     specs.set('tunnel', {
       label: label('tunnel'),
       program: [cloudflared, 'tunnel', '--no-autoupdate', '--loglevel', 'warn', '--config', tunnelConfig, 'run', tunnelId],

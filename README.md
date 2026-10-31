@@ -38,7 +38,7 @@ npm install -g https://github.com/kevinrss01/chatgpt-desktop-mcp/tarball/main
 chatgpt-desktop-mcp doctor
 ```
 
-The compiled CLI is committed in `dist/`, so installing from GitHub needs no build step. To pin a release, replace `main` with a tag such as `v0.2.0`. From a clone: `npm install && npm link`.
+The compiled CLI is committed in `dist/`, so installing from GitHub needs no build step. To pin a release, replace `main` with a tag such as `v0.3.0`. From a clone: `npm install && npm link`.
 
 ## Quick start
 
@@ -110,6 +110,7 @@ To try tools from a terminal: `CDM_URL=http://127.0.0.1:8723/mcp CDM_TOKEN=... n
 
 | Tool | What it does |
 | --- | --- |
+| `list_machines` | The Macs this endpoint can reach, whether each is available, and its access level. See [Several Macs](#several-macs-behind-one-endpoint). |
 | `list_models` | Models available to the app with their reasoning efforts and speed tiers. |
 | `list_projects` | Projects saved in the app, plus folders used by recent chats. |
 | `list_chats` | Chats sorted by last activity; filter by project, search text, or archived state. |
@@ -180,6 +181,7 @@ Install saves its settings in `~/.config/chatgpt-desktop-mcp/service.json`. Runn
 | --- | --- | --- |
 | `--hostname <host>` | none | Publish on your domain through a named Cloudflare tunnel. |
 | `--tunnel-name <name>` | `chatgpt-desktop-mcp` | Cloudflare tunnel to create or reuse. |
+| `--tunnel-credentials <file>` | none | Run a tunnel created on another Mac; see [A second Mac](#a-second-mac-without-a-cloudflare-login). |
 | `--overwrite-dns` | off | Replace an existing DNS record for the hostname. |
 | `--skip-zone-check` | off | Skip the check that the domain uses Cloudflare DNS. |
 | `--public-url <url>` | none | Use a tunnel or proxy you run yourself. The service monitors it. |
@@ -223,6 +225,57 @@ macOS asks before a background process reads Documents, Desktop, Downloads, iClo
 
 For an address that stays up while your laptop is off, run the bridge on an always-on Mac, such as a Mac mini, and point your agents there.
 
+## Several Macs behind one endpoint
+
+Run the bridge on each Mac, then register the other Macs on the one your agents connect to. Every tool gains a `machine` argument, and `list_machines` shows which Macs are reachable, so an agent can pick where to start a chat or follow one on any machine.
+
+```sh
+# On the Mac mini: run the service and create a token for the endpoint that will reach it
+chatgpt-desktop-mcp service install --hostname mini-mcp.example.com
+chatgpt-desktop-mcp token create --name laptop-endpoint
+
+# On the Mac your agents connect to
+chatgpt-desktop-mcp machine name laptop
+chatgpt-desktop-mcp machine add mini --url https://mini-mcp.example.com/mcp   # paste the token at the prompt
+chatgpt-desktop-mcp machine list
+```
+
+```text
+laptop           available   this Mac, control access, ChatGPT app open, v0.3.0
+mini             available   https://mini-mcp.example.com/mcp, control access, ChatGPT app closed, v0.3.0, 180 ms
+```
+
+Agents then pass `machine` to any tool:
+
+| Value | Runs on |
+| --- | --- |
+| omitted, `local` | The Mac serving the endpoint |
+| a name such as `mini` | That Mac |
+| `auto` | The first available Mac in the order shown by `machine list`; change it with `machine prefer <name>` |
+| `all` | Every Mac, for `list_chats` and `list_pending_requests`; results are merged and each item names its machine |
+
+Results from a routed call include `machine`, so the agent knows where a chat lives. `list_machines` reports, for each Mac, whether it answers, whether the endpoint can control it or only read it, its version, and whether its ChatGPT app is open for live control.
+
+Machines are managed only from the command line, never through MCP. Tokens for other Macs are stored in `~/.config/chatgpt-desktop-mcp/machines.json` with owner-only permissions. A few ways to limit what the endpoint can do:
+
+- Give it a `read` token from the other Mac, or add the Mac with `--read-only`. Only read tools are forwarded to it.
+- Agents holding a `read` token on the endpoint can only read, on every Mac.
+- To make both Macs entry points, register each on the other. Forwarded calls always run on the receiving Mac, so they never loop.
+
+### A second Mac without a Cloudflare login
+
+A tunnel can run on a Mac that is not logged in to Cloudflare. Create it on a Mac that is, then copy its credentials file:
+
+```sh
+# On the Mac logged in to Cloudflare
+cloudflared tunnel create mini-mcp
+cloudflared tunnel route dns mini-mcp mini-mcp.example.com
+# copy ~/.cloudflared/<tunnel-id>.json to the other Mac, then on that Mac:
+chatgpt-desktop-mcp service install --hostname mini-mcp.example.com --tunnel-credentials ./<tunnel-id>.json
+```
+
+Install copies the file into the config folder, so you can delete the copy you transferred.
+
 ## Limitations
 
 - macOS only. Live control of open chats relies on the app's internal IPC messages and may need an update after a ChatGPT release; the background engine keeps working in that case.
@@ -241,7 +294,7 @@ npm run build     # rebuild dist/ and commit it with your change
 node dist/cli.js serve --verbose
 ```
 
-The tests cover the IPC framing and a fake desktop router, token storage, model option resolution, history formatting, live-state parsing, and HTTP authentication and scopes through a real MCP client.
+The tests cover machine routing between two in-process servers, the IPC framing and a fake desktop router, token storage, model option resolution, history formatting, live-state parsing, and HTTP authentication and scopes through a real MCP client.
 
 ## License
 

@@ -7,7 +7,9 @@ import { TokenStore, type Scope } from './auth.js';
 import type { ApprovalPolicy, SandboxMode } from './bridge.js';
 import { runDoctor } from './doctor.js';
 import { startHttpServer } from './http.js';
+import { DesktopIpcClient } from './ipc.js';
 import { log, setLogLevel } from './log.js';
+import { MachineRouter, MachineStore, normalizeMachineUrl, validateMachineName, type MachineStatus } from './machines.js';
 import { configDir, defaultWorkspaceRoot } from './paths.js';
 import { protectedFolder, saveFolderAccess, watchFolderAccess } from './permissions.js';
 import { createRuntime, packageVersion } from './runtime.js';
@@ -47,6 +49,12 @@ Usage:
   chatgpt-desktop-mcp service status       Show the background agents and health
   chatgpt-desktop-mcp service check [--repair] [--quiet]
   chatgpt-desktop-mcp service uninstall    Remove the LaunchAgents (keeps the Cloudflare tunnel and DNS record)
+  chatgpt-desktop-mcp machine list         Show the Macs this server can reach and whether they are available
+  chatgpt-desktop-mcp machine add <name> --url <url> [--read-only] [--replace]
+                                           Reach another Mac through this endpoint (asks for a token from that Mac)
+  chatgpt-desktop-mcp machine remove <name>
+  chatgpt-desktop-mcp machine name [<name>]  Show or set this Mac's name
+  chatgpt-desktop-mcp machine prefer <name>  Try this machine first for machine "auto"
 
 Serve options:
   --host <address>          Listen address (default 127.0.0.1)
@@ -57,6 +65,7 @@ Serve options:
 Service install options (saved; running install again reuses them, and options you pass replace them):
   --hostname <host>         Publish on your own domain through a named Cloudflare tunnel, e.g. mcp.example.com
   --tunnel-name <name>      Cloudflare tunnel to create or reuse (default chatgpt-desktop-mcp)
+  --tunnel-credentials <file>  Run a tunnel created on another Mac (its <tunnel-id>.json); no Cloudflare login needed here
   --overwrite-dns           Replace an existing DNS record for --hostname
   --skip-zone-check         Skip the check that the hostname's domain uses Cloudflare DNS
   --public-url <url>        Use a tunnel or proxy you run yourself (Tailscale Funnel, ngrok, nginx...); monitored only
@@ -93,6 +102,7 @@ interface ServiceArgs {
   port?: string;
   hostname?: string;
   'tunnel-name'?: string;
+  'tunnel-credentials'?: string;
   'public-url'?: string;
   'local-only': boolean;
   'keep-awake'?: string;
@@ -118,7 +128,7 @@ async function waitForHealth(url: string, timeoutMs: number): Promise<boolean> {
 function describeSettings(settings: ServiceSettings): string[] {
   const base = publicBaseUrl(settings);
   const exposure = settings.hostname
-    ? `${base}/mcp (Cloudflare tunnel "${settings.tunnelName}")`
+    ? `${base}/mcp (Cloudflare tunnel ${settings.tunnelName ? `"${settings.tunnelName}"` : 'from a credentials file'})`
     : settings.publicUrl
       ? `${base}/mcp (your own tunnel or proxy, monitored only)`
       : 'none, this Mac only';
@@ -155,6 +165,7 @@ async function serviceCommand(subcommand: string | undefined, args: ServiceArgs,
             port: args.port === undefined ? undefined : parsePort(args.port),
             hostname: args.hostname,
             tunnelName: args['tunnel-name'],
+            tunnelCredentials: args['tunnel-credentials'] === undefined ? undefined : resolve(args['tunnel-credentials']),
             publicUrl: args['public-url'],
             localOnly: args['local-only'],
             keepAwake: keepAwake as KeepAwake | undefined,
@@ -250,11 +261,136 @@ async function serviceCommand(subcommand: string | undefined, args: ServiceArgs,
       if (config?.tunnelName) {
         out(`Kept the Cloudflare tunnel "${config.tunnelName}"${config.hostname ? ` and the DNS record for ${config.hostname}` : ''}.`);
         out(`To delete them: cloudflared tunnel delete ${config.tunnelName}, then remove the DNS record in the Cloudflare dashboard.`);
+      } else if (config?.tunnelCredentials) {
+        out('Kept the Cloudflare tunnel and its DNS record. Delete them from the Mac that created the tunnel.');
       }
       return;
     }
     default:
       fail('Usage: chatgpt-desktop-mcp service install|status|check|uninstall');
+  }
+}
+
+/** Reads a secret from a pipe, or from the terminal without echoing it. */
+async function readSecret(prompt: string): Promise<string> {
+  const stdin = process.stdin;
+  if (!stdin.isTTY) {
+    const chunks: Buffer[] = [];
+    for await (const chunk of stdin) chunks.push(Buffer.from(chunk as Buffer));
+    return Buffer.concat(chunks).toString('utf8').trim();
+  }
+  process.stderr.write(prompt);
+  stdin.setRawMode(true);
+  stdin.resume();
+  stdin.setEncoding('utf8');
+  return new Promise((resolvePromise, reject) => {
+    let value = '';
+    const cleanup = () => {
+      stdin.off('data', onData);
+      stdin.setRawMode(false);
+      stdin.pause();
+      process.stderr.write('\n');
+    };
+    const onData = (chunk: string) => {
+      for (const character of chunk) {
+        if (character === '\r' || character === '\n') {
+          cleanup();
+          resolvePromise(value.trim());
+          return;
+        }
+        if (character === '\u0003') {
+          cleanup();
+          reject(new Error('Cancelled'));
+          return;
+        }
+        if (character === '\u007f' || character === '\b') value = value.slice(0, -1);
+        else value += character;
+      }
+    };
+    stdin.on('data', onData);
+  });
+}
+
+function printMachines(statuses: MachineStatus[], store: MachineStore): void {
+  const out = (line: string) => process.stdout.write(`${line}\n`);
+  const records = new Map(store.list().map((record) => [record.name, record]));
+  for (const status of statuses) {
+    const state = status.available ? 'available' : 'unavailable';
+    const details = [
+      status.local ? 'this Mac' : (records.get(status.name)?.url ?? ''),
+      status.access ? `${status.access} access` : null,
+      status.liveAppControl === null ? null : status.liveAppControl ? 'ChatGPT app open' : 'ChatGPT app closed',
+      status.version ? `v${status.version}` : null,
+      !status.local && status.latencyMs !== null ? `${status.latencyMs} ms` : null,
+      status.error,
+    ].filter(Boolean);
+    out(`${status.name.padEnd(16)} ${state.padEnd(11)} ${details.join(', ')}`);
+  }
+}
+
+interface MachineArgs {
+  url?: string;
+  'read-only': boolean;
+  replace: boolean;
+}
+
+async function machineCommand(subcommand: string | undefined, name: string | undefined, args: MachineArgs): Promise<void> {
+  const out = (line: string) => process.stdout.write(`${line}\n`);
+  const store = new MachineStore(configDir());
+  const router = new MachineRouter(store, { version: packageVersion(), liveAppControl: () => new DesktopIpcClient().isAvailable() });
+  try {
+    switch (subcommand) {
+      case undefined:
+      case 'list': {
+        if (store.list().length === 0) {
+          out(`This Mac is "${store.localName()}". No other machines yet.`);
+          out('Add one with: chatgpt-desktop-mcp machine add <name> --url https://<host>/mcp');
+          return;
+        }
+        printMachines(await router.statuses('control'), store);
+        out('Agents pick a machine with the machine argument; "auto" tries them in this order.');
+        return;
+      }
+      case 'add': {
+        if (!name || !args.url) fail('Usage: chatgpt-desktop-mcp machine add <name> --url https://<host>/mcp [--read-only] [--replace]');
+        validateMachineName(name);
+        normalizeMachineUrl(args.url);
+        const token = await readSecret(`Token for ${name} (from "chatgpt-desktop-mcp token create" on that Mac): `);
+        if (!token) fail('No token given. Paste it at the prompt or pipe it in: pbpaste | chatgpt-desktop-mcp machine add ...');
+        const record = store.add({ name, url: args.url, token, readOnly: args['read-only'] }, args.replace);
+        out(`Added ${record.name} (${record.url})${record.readOnly ? ', read-only' : ''}.`);
+        const status = (await router.statuses('control')).find((entry) => entry.name === record.name);
+        if (status) printMachines([status], store);
+        if (status && !status.available) process.exitCode = 1;
+        return;
+      }
+      case 'remove': {
+        if (!name) fail('Usage: chatgpt-desktop-mcp machine remove <name>');
+        if (!store.remove(name)) fail(`No machine named "${name}".`);
+        out(`Removed ${name}. Revoke its token on that Mac with: chatgpt-desktop-mcp token revoke <name>`);
+        return;
+      }
+      case 'name': {
+        if (!name) {
+          out(store.localName());
+          return;
+        }
+        store.setLocalName(name);
+        out(`This Mac is now "${store.localName()}".`);
+        return;
+      }
+      case 'prefer': {
+        if (!name) fail('Usage: chatgpt-desktop-mcp machine prefer <name>');
+        out(`"auto" now tries: ${store.prefer(name.toLowerCase()).join(', ')}`);
+        return;
+      }
+      default:
+        fail('Usage: chatgpt-desktop-mcp machine list|add|remove|name|prefer');
+    }
+  } catch (error) {
+    fail(errorMessage(error));
+  } finally {
+    router.close();
   }
 }
 
@@ -267,6 +403,7 @@ async function main(): Promise<void> {
       tunnel: { type: 'boolean', default: false },
       hostname: { type: 'string' },
       'tunnel-name': { type: 'string' },
+      'tunnel-credentials': { type: 'string' },
       'public-url': { type: 'string' },
       'local-only': { type: 'boolean', default: false },
       'keep-awake': { type: 'string' },
@@ -284,6 +421,8 @@ async function main(): Promise<void> {
       sandbox: { type: 'string' },
       'approval-policy': { type: 'string' },
       'read-only': { type: 'boolean', default: false },
+      url: { type: 'string' },
+      replace: { type: 'boolean', default: false },
       name: { type: 'string' },
       scope: { type: 'string', default: 'control' },
       verbose: { type: 'boolean', default: false },
@@ -359,10 +498,17 @@ async function main(): Promise<void> {
       await serviceCommand(subcommand, values, serve, tokens);
       return;
     }
+    case 'machine':
+    case 'machines': {
+      await machineCommand(subcommand, argument, values);
+      return;
+    }
     case 'stdio': {
       const runtime = createRuntime(runtimeOptions);
-      const server = createMcpServer(runtime.bridge, values['read-only'] ? 'read' : 'control', runtime.version);
+      const router = new MachineRouter(new MachineStore(configDir()), { version: runtime.version, liveAppControl: () => runtime.ipc.isAvailable() });
+      const server = createMcpServer(runtime.bridge, values['read-only'] ? 'read' : 'control', runtime.version, router);
       const shutdown = () => {
+        router.close();
         runtime.shutdown();
         process.exit(0);
       };
@@ -386,14 +532,17 @@ async function main(): Promise<void> {
         }
       }
       const runtime = createRuntime(runtimeOptions);
+      const router = new MachineRouter(new MachineStore(configDir()), { version: runtime.version, liveAppControl: () => runtime.ipc.isAvailable() });
       const http = await startHttpServer({
         host: values.host,
         port,
         tokens,
         allowedOrigins: values['allow-origin'] ?? [],
-        createServer: (scope) => createMcpServer(runtime.bridge, scope, runtime.version),
+        createServer: (scope) => createMcpServer(runtime.bridge, scope, runtime.version, router),
       });
       log.info(`MCP endpoint: ${http.url}`);
+      const machines = router.store.list();
+      if (machines.length > 0) log.info(`This Mac is "${router.localName()}"; other machines: ${machines.map((machine) => machine.name).join(', ')}`);
       let stopTunnel: (() => void) | null = null;
       if (values.tunnel) {
         const tunnel = await startQuickTunnel(`http://127.0.0.1:${http.port}`);
@@ -414,6 +563,7 @@ async function main(): Promise<void> {
       }
       const shutdown = () => {
         stopTunnel?.();
+        router.close();
         runtime.shutdown();
         void http.close().finally(() => process.exit(0));
       };
