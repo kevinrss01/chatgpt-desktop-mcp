@@ -21,7 +21,7 @@ function fakeBridge(label: string): DesktopBridge {
       if (!chatId.startsWith(label)) throw new Error(`thread not loaded: ${chatId}`);
       return { chatId, running: false };
     },
-    createChat: async (params: { prompt?: string }) => ({ chatId: `${label}-new`, turnId: 't1', prompt: params.prompt }),
+    createChat: async (params: { prompt?: string }) => ({ chatId: `${label}-new`, turnId: null, turnStarted: Boolean(params.prompt), deliveredVia: 'app', prompt: params.prompt }),
     // The first wait times out so the hub has to wait again.
     waitForChat: async (chatId: string) => ({ chatId, running: waits === 0, timedOut: waits++ === 0 }),
   } as unknown as DesktopBridge;

@@ -1,6 +1,10 @@
 import { randomUUID } from 'node:crypto';
+import { execFile } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { promisify } from 'node:util';
 import { DesktopIpcClient, IpcRequestError } from './ipc.js';
-import { asArray, asString, isRecord } from './util.js';
+import { APP_BUNDLE_PATHS } from './paths.js';
+import { asArray, asString, isRecord, sleep } from './util.js';
 
 const HOST_ID = 'local';
 
@@ -114,6 +118,23 @@ export class DesktopApp {
 
   isRunning(): boolean {
     return this.ipc.isAvailable();
+  }
+
+  /** Open the stored chat normally, then wait until the app actually owns it. */
+  async openChat(chatId: string): Promise<LiveChatState> {
+    const app = APP_BUNDLE_PATHS.find((path) => existsSync(path));
+    if (!app) throw new IpcRequestError('app-not-installed', 'The Codex desktop app was not found.');
+    await promisify(execFile)('/usr/bin/open', ['-g', '-a', app, `codex://threads/${encodeURIComponent(chatId)}`]);
+    const deadline = Date.now() + 30_000;
+    while (Date.now() < deadline) {
+      const { settings } = await this.ownedChatSettings(chatId, 'quick');
+      if (settings?.resumeState === 'resumed') {
+        const { state } = await this.liveState(chatId);
+        if (state) return state;
+      }
+      await sleep(250);
+    }
+    throw new IpcRequestError('handoff-timeout', `The desktop app did not take ownership of chat ${chatId}. No message was sent. Open the chat and retry send_message.`);
   }
 
   /**

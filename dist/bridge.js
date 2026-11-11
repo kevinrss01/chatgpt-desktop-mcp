@@ -286,6 +286,12 @@ export class DesktopBridge {
     }
     // --------------------------------------------------------------- controls
     async createChat(params) {
+        const inApp = params.execution !== 'background';
+        const sandbox = this.forcedSetting('sandbox', params.sandbox);
+        const approvalPolicy = this.forcedSetting('approvalPolicy', params.approvalPolicy);
+        if (inApp && (sandbox || approvalPolicy)) {
+            throw new BridgeError('Desktop chats use the permissions selected in the app. Explicit sandbox or approvalPolicy overrides require execution "background"; they cannot be silently applied to an app-owned chat.');
+        }
         const cwd = params.project ? await this.resolveProjectPath(params.project, true) : this.newChatFolder(params.prompt);
         const models = await this.listModels();
         const model = params.model ? findModel(models, params.model) : models.find((entry) => entry.isDefault);
@@ -293,18 +299,16 @@ export class DesktopBridge {
             throw new BridgeError(`Unknown model "${params.model}". Use list_models to see available models.`);
         const effort = validateEffort(model, params.effort);
         const speed = resolveSpeed(model, params.speed);
-        const start = { cwd, serviceName: 'chatgpt-desktop-mcp' };
+        const start = { cwd, serviceName: 'chatgpt-desktop-mcp', ...(inApp ? { config: { thread_unload_delay_secs: 0 } } : {}) };
         if (params.model && model)
             start.model = model.id;
         if (speed)
             start.serviceTier = speed;
-        const sandbox = this.forcedSetting('sandbox', params.sandbox);
-        const approvalPolicy = this.forcedSetting('approvalPolicy', params.approvalPolicy);
         if (sandbox)
             start.sandbox = sandbox;
         if (approvalPolicy)
             start.approvalPolicy = approvalPolicy;
-        const { started, chatId, turnId } = await this.withRunner(async () => {
+        const { started, chatId, turnId: bridgeTurnId } = await this.withRunner(async () => {
             const response = await this.runner.request('thread/start', start);
             const thread = isRecord(response) && isRecord(response.thread) ? response.thread : null;
             const id = asString(thread?.id);
@@ -312,19 +316,65 @@ export class DesktopBridge {
                 throw new BridgeError('codex app-server did not return a chat id.');
             if (params.title)
                 await this.runner.request('thread/name/set', { threadId: id, name: params.title });
-            const firstTurn = params.prompt
+            if (inApp) {
+                // Never start a turn before ownership passes to the app. Unsubscribe only
+                // this idle chat, so other background jobs are not interrupted.
+                await this.runner.request('thread/unsubscribe', { threadId: id });
+                await this.waitUntilRunnerReleases(id);
+            }
+            const firstTurn = !inApp && params.prompt
                 ? await this.startBridgeTurn(id, params.prompt, { model: params.model ? model?.id : undefined, effort, speed })
                 : null;
             return { started: response, chatId: id, turnId: firstTurn };
         });
+        let turnId = bridgeTurnId;
+        let appState = null;
+        if (inApp) {
+            try {
+                appState = await this.desktop.openChat(chatId);
+                if (params.prompt) {
+                    const sent = await this.sendMessage({ chatId, message: params.prompt, model: params.model, effort, speed: params.speed });
+                    turnId = sent.turnId;
+                }
+                else if (params.model || effort) {
+                    const selectedModel = params.model ? model?.id : appState.model;
+                    if (!selectedModel || !await this.desktop.updateNextTurnSettings(chatId, { model: selectedModel, effort: effort ?? appState.reasoningEffort })) {
+                        throw new BridgeError('The desktop app did not apply the requested model settings.');
+                    }
+                }
+            }
+            catch (error) {
+                throw new BridgeError(`Chat ${chatId} was created, but desktop delivery was not confirmed: ${errorMessage(error)}. Check this chat before retrying; do not create a duplicate.`, { cause: error });
+            }
+        }
         return {
             chatId,
             turnId,
+            turnStarted: Boolean(params.prompt),
+            deliveredVia: inApp ? 'app' : 'bridge',
             cwd,
-            model: asString(isRecord(started) ? started.model : null) ?? model?.id ?? null,
-            reasoningEffort: effort ?? asString(isRecord(started) ? started.reasoningEffort : null),
-            speed: speed ?? asString(isRecord(started) ? started.serviceTier : null),
+            model: params.model ? model?.id ?? null : appState?.model ?? asString(isRecord(started) ? started.model : null) ?? model?.id ?? null,
+            reasoningEffort: effort ?? appState?.reasoningEffort ?? asString(isRecord(started) ? started.reasoningEffort : null),
+            speed: speed ?? appState?.speed ?? asString(isRecord(started) ? started.serviceTier : null),
         };
+    }
+    async waitUntilRunnerReleases(chatId) {
+        const deadline = Date.now() + 10_000;
+        do {
+            let cursor = null;
+            let loaded = false;
+            do {
+                const page = await this.runner.request('thread/loaded/list', { limit: 100, ...(cursor ? { cursor } : {}) });
+                if (!isRecord(page) || !Array.isArray(page.data))
+                    throw new BridgeError('Could not confirm that the background engine released the chat.');
+                loaded = page.data.includes(chatId);
+                cursor = asString(page.nextCursor);
+            } while (!loaded && cursor && Date.now() < deadline);
+            if (!loaded && !cursor)
+                return;
+            await sleep(100);
+        } while (Date.now() < deadline);
+        throw new BridgeError(`The background engine has not released chat ${chatId}. No prompt was sent.`);
     }
     sendMessage(params) {
         // Serialize actions per chat so two callers cannot both see it idle and start two turns.
@@ -342,6 +392,14 @@ export class DesktopBridge {
         }
         catch (error) {
             throw new BridgeError(`The ChatGPT app did not confirm whether it has this chat open (${errorMessage(error)}). The message was not sent, to avoid running it twice.`, { cause: error });
+        }
+        if (!live && params.execution !== 'background') {
+            if (this.options.sandbox || this.options.approvalPolicy) {
+                throw new BridgeError('This bridge forces permission overrides. Use execution "background" or open the chat in the app and use its permissions.');
+            }
+            if (!await this.threadMeta(params.chatId))
+                throw new BridgeError(`Chat ${params.chatId} was not found.`);
+            live = await this.desktop.openChat(params.chatId);
         }
         if (live) {
             const turn = await this.resolveTurnOptions(params, live.model);

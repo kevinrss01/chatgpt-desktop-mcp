@@ -2,7 +2,7 @@
 
 An MCP server that lets other agents work with the Codex chats in the **ChatGPT desktop app on your Mac**: list and read conversations, start new chats in your projects, send follow-ups, pick the model, reasoning effort, and speed, steer or interrupt running work, and answer approvals. It runs locally and can be exposed to the internet behind bearer tokens, so a remote agent can monitor and drive your Codex work.
 
-Chats created this way show up in the app's sidebar, and messages sent to a chat that is open in the app appear live in its window.
+New chats open in the desktop app by default. You can type, steer, and interrupt them while they are running, without the “This is open in another app” lock.
 
 > **Unofficial.** Not affiliated with OpenAI. It combines the documented Codex app-server protocol with the desktop app's local IPC channel, which is internal and can change when the app updates. Run `chatgpt-desktop-mcp doctor` after updating the app.
 
@@ -20,14 +20,17 @@ flowchart LR
 
 The bridge routes each request to the right place:
 
-- **Chats open in a ChatGPT window** are driven through the app itself, the same way the app's own surfaces coordinate. Messages, model changes, steering, and interrupts appear live in the window.
-- **Everything else** (listing, history, model catalog, new chats, chats not open in the app) goes through a private `codex app-server` started from the binary bundled inside ChatGPT.app. It shares `~/.codex` with the app, so it sees the same chats, projects, sign-in, MCP servers, and settings.
+- **New chats and follow-ups** run through the desktop app by default. The bridge creates an empty chat, releases its writer lock, opens its `codex://threads/…` link, and waits for the app to own it before sending the first prompt over local IPC. Stored chats are opened before sending a follow-up. Opening a chat changes the selected chat in the app window.
+- **Listing, history, and the model catalog** use a private `codex app-server` with the same `~/.codex` storage. It does not run the default chat turns.
+- **Explicit headless runs** use `execution: "background"` on `create_chat` or `send_message`. Chats already owned by the app continue to use its live controls. This mode remains useful when no desktop session is available.
 
-Codex lets only one process write to a chat at a time. The process that runs bridge turns exits about two seconds after its last turn so the app can open those chats again.
+Codex lets only one process write to a chat at a time. Default app execution keeps that owner inside the desktop app. Explicit background execution still locks its chats until the runner's last active turn finishes and the runner exits. A failed app handoff returns an error with the existing chat ID; it never silently starts a headless turn or retries a possibly delivered prompt.
+
+**Upgrading from 0.3:** `app` is now the default execution mode. It uses the permissions selected in the desktop app. Explicit `sandbox` / `approvalPolicy` arguments or operator-enforced overrides require `execution: "background"` when creating a chat. `create_chat` returns `deliveredVia` and `turnStarted`; an app-started turn may have `turnId: null`, and `wait: true` still waits for it.
 
 ## Requirements
 
-- macOS with the ChatGPT desktop app and Codex. Verified with ChatGPT 26.1027.30824 (bundled Codex 0.166.0-alpha.5.1).
+- macOS with the ChatGPT desktop app and Codex. App execution needs a logged-in desktop session and an app-server supporting `thread/unsubscribe` and `thread_unload_delay_secs`.
 - Node.js 22 or newer.
 - Optional: [`cloudflared`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) for a public URL (`brew install cloudflared`). A fixed URL also needs a domain on Cloudflare.
 
@@ -278,9 +281,9 @@ Install copies the file into the config folder, so you can delete the copy you t
 
 ## Limitations
 
-- macOS only. Live control of open chats relies on the app's internal IPC messages and may need an update after a ChatGPT release; the background engine keeps working in that case.
-- When a chat is not open in the app, the app's router needs about 10 seconds to confirm that before the bridge runs the message in its background engine. Messages to open chats are delivered immediately.
-- While the bridge is running a turn in a chat that is not open in the app, the app can show that chat but cannot continue it until the turn ends.
+- macOS only. Live control relies on the app's internal IPC messages and may need an update after a ChatGPT release. Use explicit background execution if desktop control is unavailable.
+- When a chat is not open in the app, the router can take about 10 seconds to confirm that before the bridge opens it. A new-chat handoff waits up to 30 seconds for the desktop app to take ownership.
+- Explicit background turns still prevent desktop input until the runner releases them. Existing background turns are not moved or interrupted by an app handoff for another chat.
 - Renaming or archiving a chat that the app currently has loaded is refused; do it in the app.
 - Approvals for runs inside the app are answered in the app; `get_chat_status` shows that one is waiting.
 - Messages are text only. Regular ChatGPT conversations outside Codex are stored in your ChatGPT account, not in `~/.codex`, and are not covered.

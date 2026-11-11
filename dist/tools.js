@@ -5,7 +5,7 @@ import { describeMachineError } from './machines.js';
 import { BridgeError, errorMessage, isRecord } from './util.js';
 export const SERVER_NAME = 'chatgpt-desktop-mcp';
 const INSTRUCTIONS = `Controls Codex chats in the ChatGPT desktop app on the user's Mac.
-Chats open in an app window are driven live through the app; other chats run in a background Codex engine that shares the app's history.
+New chats and messages use the desktop app by default, so the user can type and steer while they run. This opens the chat in the app window. Set execution to "background" explicitly for headless runs, which lock the chat until the run finishes.
 Typical flow: list_chats or create_chat, then send_message, then wait_for_chat and read_chat.
 Use list_models to discover valid model, reasoning effort, and speed values.`;
 const MACHINE_INSTRUCTIONS = (localName) => `
@@ -55,7 +55,7 @@ async function forward(name, target, args) {
         const { wait: _wait, waitSeconds, ...rest } = args;
         const sent = remoteValue(await target.remote.callTool(name, rest), target.name);
         const chatId = name === 'send_message' ? String(args.chatId) : isRecord(sent) && typeof sent.chatId === 'string' ? sent.chatId : null;
-        const started = name === 'send_message' || (isRecord(sent) && typeof sent.turnId === 'string');
+        const started = name === 'send_message' || (isRecord(sent) && (sent.turnStarted === true || typeof sent.turnId === 'string'));
         if (!chatId || !started || !isRecord(sent))
             return sent;
         return { ...sent, result: await waitRemote(target, chatId, typeof waitSeconds === 'number' ? waitSeconds : 60) };
@@ -63,6 +63,7 @@ async function forward(name, target, args) {
     return remoteValue(await target.remote.callTool(name, args), target.name);
 }
 const chatId = z.string().min(1).describe('Chat id from list_chats or create_chat.');
+const execution = z.enum(['app', 'background']).optional().describe('Default app: opens the chat in the desktop app so the user can steer it live. Background explicitly uses the headless engine and locks the chat while running.');
 const turnOptions = {
     model: z.string().optional().describe('Model id from list_models. Defaults to the chat or app default.'),
     effort: z.string().optional().describe('Reasoning effort supported by the model, for example low, medium, high, xhigh.'),
@@ -230,21 +231,22 @@ export function createMcpServer(bridge, scope, version, router) {
         return server;
     register('create_chat', {
         title: 'Create chat',
-        description: 'Creates a Codex chat that appears in the ChatGPT app. With a prompt it starts working immediately. Without a project, a new folder is created under the workspace root, like the app does.',
+        description: 'Creates and opens a Codex chat in the desktop app, where the user can type while it works. With a prompt it starts immediately. Use execution background explicitly for headless runs. Without a project, creates a folder under the workspace root.',
         inputSchema: {
             prompt: z.string().optional().describe('First message. Omit to create an empty chat.'),
             project: z.string().optional().describe('Project name from list_projects or an absolute folder path.'),
             title: z.string().optional(),
+            execution,
             ...turnOptions,
-            sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional().describe('Defaults to the Codex config.'),
-            approvalPolicy: z.enum(['untrusted', 'on-request', 'never']).optional().describe('Defaults to the Codex config.'),
+            sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional().describe('Requires execution background. Desktop chats use the app permissions.'),
+            approvalPolicy: z.enum(['untrusted', 'on-request', 'never']).optional().describe('Requires execution background. Desktop chats use the app permissions.'),
             wait: z.boolean().optional().describe('Wait for the first turn to finish (up to waitSeconds).'),
             waitSeconds: z.number().int().min(1).max(300).optional().describe('Default 60.'),
         },
         annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
     }, { control: true }, async ({ wait, waitSeconds, ...params }) => {
         const created = await bridge.createChat(params);
-        if (!wait || !created.turnId)
+        if (!wait || !created.turnStarted)
             return created;
         return { ...created, result: await bridge.waitForChat(created.chatId, (waitSeconds ?? 60) * 1000) };
     });
@@ -254,6 +256,7 @@ export function createMcpServer(bridge, scope, version, router) {
         inputSchema: {
             chatId,
             message: z.string().min(1),
+            execution,
             ...turnOptions,
             whenBusy: z
                 .enum(['reject', 'steer', 'interrupt'])
