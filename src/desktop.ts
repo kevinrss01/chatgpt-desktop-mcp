@@ -120,6 +120,26 @@ export class DesktopApp {
     return this.ipc.isAvailable();
   }
 
+  /** Shows a chat in the app without waiting for anything. Launches the app if needed. */
+  async revealChat(chatId: string): Promise<void> {
+    await this.openAppUrl(`codex://threads/${encodeURIComponent(chatId)}`);
+  }
+
+  /**
+   * Asks the app to send a chat's queued messages. The app resumes the chat
+   * when its server-side queue is not empty and dispatches the first message;
+   * later messages follow when each turn ends. Launches the app if needed.
+   */
+  async wakeChat(chatId: string): Promise<void> {
+    await this.openAppUrl(`codex://threads/wake/${encodeURIComponent(chatId)}`);
+  }
+
+  private async openAppUrl(url: string): Promise<void> {
+    const app = APP_BUNDLE_PATHS.find((path) => existsSync(path));
+    if (!app) throw new IpcRequestError('app-not-installed', 'The Codex desktop app was not found.');
+    await promisify(execFile)('/usr/bin/open', ['-g', '-a', app, url]);
+  }
+
   /** Open the stored chat normally, then wait until the app actually owns it. */
   async openChat(chatId: string): Promise<LiveChatState> {
     const app = APP_BUNDLE_PATHS.find((path) => existsSync(path));
@@ -152,7 +172,11 @@ export class DesktopApp {
       );
     } catch (error) {
       if (error instanceof IpcRequestError) {
-        if (error.code === 'no-client-found' || error.code === 'app-not-running') return { settings: null, uncertain: false };
+        // ChatGPT 26.1120 removed the IPC router but can leave its socket file behind,
+        // so a refused connection means "no live control", like a missing socket.
+        if (error.code === 'no-client-found' || error.code === 'app-not-running' || error.code === 'connect-failed') {
+          return { settings: null, uncertain: false };
+        }
         if (error.code === 'timeout' && mode === 'quick') return { settings: null, uncertain: true };
       }
       throw error;

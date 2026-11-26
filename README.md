@@ -2,9 +2,9 @@
 
 An MCP server that lets other agents work with the Codex chats in the **ChatGPT desktop app on your Mac**: list and read conversations, start new chats in your projects, send follow-ups, pick the model, reasoning effort, and speed, steer or interrupt running work, and answer approvals. It runs locally and can be exposed to the internet behind bearer tokens, so a remote agent can monitor and drive your Codex work.
 
-New chats open in the desktop app by default. You can type, steer, and interrupt them while they are running, without the “This is open in another app” lock.
+New chats and follow-ups run inside the desktop app by default, with the model, effort, and speed you asked for, so you can watch them and type in them without the “This is open in another app” lock.
 
-> **Unofficial.** Not affiliated with OpenAI. It combines the documented Codex app-server protocol with the desktop app's local IPC channel, which is internal and can change when the app updates. Run `chatgpt-desktop-mcp doctor` after updating the app.
+> **Unofficial.** Not affiliated with OpenAI. It combines the Codex app-server protocol with the desktop app's `codex://` links (and, on app versions before 26.1120, its internal IPC channel). These can change when the app updates. Run `chatgpt-desktop-mcp doctor` after updating the app.
 
 ## How it works
 
@@ -12,7 +12,7 @@ New chats open in the desktop app by default. You can type, steer, and interrupt
 flowchart LR
   Agent["Remote agent or MCP client"] -->|"HTTPS + bearer token"| Tunnel["Tunnel or reverse proxy"]
   Tunnel --> MCP["chatgpt-desktop-mcp\n127.0.0.1:8723/mcp"]
-  MCP -->|"local IPC (~/.codex/ipc)"| App["ChatGPT desktop app\nchats open in a window"]
+  MCP -->|"codex://threads/wake/…"| App["ChatGPT desktop app\nruns queued messages"]
   MCP -->|"stdio JSON-RPC"| Engine["codex app-server\nbundled with ChatGPT.app"]
   App --> Store[("~/.codex\nchats, projects, config")]
   Engine --> Store
@@ -20,17 +20,19 @@ flowchart LR
 
 The bridge routes each request to the right place:
 
-- **New chats and follow-ups** run through the desktop app by default. The bridge creates an empty chat, releases its writer lock, opens its `codex://threads/…` link, and waits for the app to own it before sending the first prompt over local IPC. Stored chats are opened before sending a follow-up. Opening a chat changes the selected chat in the app window.
+- **New chats and follow-ups** run through the desktop app by default. For a new chat, the bridge creates it, saves the model, reasoning effort, and speed in it, and releases its writer lock. It then adds the message to the chat's queue (`thread/queue/add`) and opens `codex://threads/wake/<id>`, which makes the app send the queued message itself. If the chat is busy, the message waits in the queue and the app sends it when the current turn ends. The bridge never resends a queued message.
 - **Listing, history, and the model catalog** use a private `codex app-server` with the same `~/.codex` storage. It does not run the default chat turns.
-- **Explicit headless runs** use `execution: "background"` on `create_chat` or `send_message`. Chats already owned by the app continue to use its live controls. This mode remains useful when no desktop session is available.
+- **Explicit headless runs** use `execution: "background"` on `create_chat` or `send_message`. This mode remains useful when no desktop session is available, and it is the only one where the bridge can steer, interrupt, or answer approvals.
 
-Codex lets only one process write to a chat at a time. Default app execution keeps that owner inside the desktop app. Explicit background execution still locks its chats until the runner's last active turn finishes and the runner exits. A failed app handoff returns an error with the existing chat ID; it never silently starts a headless turn or retries a possibly delivered prompt.
+Codex lets only one process write to a chat at a time. Default app execution keeps that owner inside the desktop app. Explicit background execution still locks its chats until the runner's last active turn finishes and the runner exits. If a new chat's prompt cannot be queued, the empty chat is archived and the call fails; the bridge never silently falls back to a headless turn.
+
+**Upgrading from 0.4:** ChatGPT 26.1120 removed the IPC router that 0.4 used to hand chats to the app. 0.4 then created empty chats that showed the app's default model. 0.5 delivers through the chat queue instead. `send_message` accepts `whenBusy: "queue"` and can return `action: "queued"`. Steer and interrupt only work for background runs; changing the model of a chat loaded in the app is refused.
 
 **Upgrading from 0.3:** `app` is now the default execution mode. It uses the permissions selected in the desktop app. Explicit `sandbox` / `approvalPolicy` arguments or operator-enforced overrides require `execution: "background"` when creating a chat. `create_chat` returns `deliveredVia` and `turnStarted`; an app-started turn may have `turnId: null`, and `wait: true` still waits for it.
 
 ## Requirements
 
-- macOS with the ChatGPT desktop app and Codex. App execution needs a logged-in desktop session and an app-server supporting `thread/unsubscribe` and `thread_unload_delay_secs`.
+- macOS with the ChatGPT desktop app and Codex. App execution needs a logged-in desktop session and an app-server supporting `thread/queue/*` and `thread/settings/update` (ChatGPT 26.1120 or later).
 - Node.js 22 or newer.
 - Optional: [`cloudflared`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) for a public URL (`brew install cloudflared`). A fixed URL also needs a domain on Cloudflare.
 
@@ -121,12 +123,12 @@ To try tools from a terminal: `CDM_URL=http://127.0.0.1:8723/mcp CDM_TOKEN=... n
 | `get_chat_status` | Whether the chat is running and where (`app`, `bridge`, or `stored`), its model, effort, and speed, pending approvals, and the latest assistant message. |
 | `wait_for_chat` | Waits until the chat stops running (up to 300 s), then returns its status. |
 | `create_chat` | Starts a chat in a project (or a new folder under `~/Documents/Codex/<date>/`, as the app does) with an optional first prompt, model, effort, speed, sandbox, and approval policy. |
-| `send_message` | Sends a follow-up. If the chat is busy, `whenBusy` chooses to reject, steer the running turn, or interrupt it first. |
+| `send_message` | Sends a follow-up. If the chat is busy, `whenBusy` chooses to reject, queue it after the current turn, or (background runs only) steer or interrupt. |
 | `interrupt_chat` | Stops the running turn. |
 | `rename_chat`, `archive_chat` | Retitle, archive, or restore a chat. |
 | `list_pending_requests`, `respond_to_request` | See and answer command, file, question, and MCP approval requests from chats the bridge runs. |
 
-**Model, effort, and speed.** `list_models` returns valid values. `speed` accepts `standard`, a tier id such as `priority` or `ultrafast`, or a tier name such as `Fast`. For a chat open in the app, a model or effort change is applied for the next turn, as the app's model picker does.
+**Model, effort, and speed.** `list_models` returns valid values. `speed` accepts `standard`, a tier id such as `priority` or `ultrafast`, or a tier name such as `Fast`. They are saved in the chat before the app opens it. A chat that the app currently has loaded keeps its settings; change them in the app.
 
 A typical monitoring loop: `list_chats` to see what changed, `get_chat_status` for live state, `wait_for_chat` until a run ends, then `read_chat` for the transcript.
 
@@ -224,7 +226,7 @@ macOS asks before a background process reads Documents, Desktop, Downloads, iClo
 - **Restart or shutdown:** everything starts again once you log in. With FileVault on, macOS waits for your password at boot, so the URL is down until then. To power back on after a power cut, run `sudo pmset -a autorestart 1`.
 - **Sleep:** a sleeping Mac cannot answer. `--keep-awake` prevents idle sleep; on battery only with `always`.
 - **Closing the lid:** the Mac sleeps unless it is in clamshell mode (power plus an external display). `sudo pmset -a disablesleep 1` keeps it awake with the lid closed; undo with `sudo pmset -a disablesleep 0`. A closed, awake laptop runs warm, so do not put it in a bag.
-- **The ChatGPT app:** listing, reading, and new chats work without it. Live control of chats open in a window needs the app running.
+- **The ChatGPT app:** listing and reading work without it. App execution launches it if needed; a message the app has not picked up stays queued and returns `action: "queued"`.
 
 For an address that stays up while your laptop is off, run the bridge on an always-on Mac, such as a Mac mini, and point your agents there.
 
@@ -281,8 +283,8 @@ Install copies the file into the config folder, so you can delete the copy you t
 
 ## Limitations
 
-- macOS only. Live control relies on the app's internal IPC messages and may need an update after a ChatGPT release. Use explicit background execution if desktop control is unavailable.
-- When a chat is not open in the app, the router can take about 10 seconds to confirm that before the bridge opens it. A new-chat handoff waits up to 30 seconds for the desktop app to take ownership.
+- macOS only. App delivery relies on the app's `codex://threads/wake` link and may need an update after a ChatGPT release. Use explicit background execution if desktop delivery is unavailable.
+- The bridge waits up to 30 seconds for the app to pick up a queued message. Without live control, a turn the app runs is detected from stored history (a turn with no completion time), so a crashed turn can look like it is still running.
 - Explicit background turns still prevent desktop input until the runner releases them. Existing background turns are not moved or interrupted by an app handoff for another chat.
 - Renaming or archiving a chat that the app currently has loaded is refused; do it in the app.
 - Approvals for runs inside the app are answered in the app; `get_chat_status` shows that one is waiting.

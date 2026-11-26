@@ -5,7 +5,7 @@ import { describeMachineError } from './machines.js';
 import { BridgeError, errorMessage, isRecord } from './util.js';
 export const SERVER_NAME = 'chatgpt-desktop-mcp';
 const INSTRUCTIONS = `Controls Codex chats in the ChatGPT desktop app on the user's Mac.
-New chats and messages use the desktop app by default, so the user can type and steer while they run. This opens the chat in the app window. Set execution to "background" explicitly for headless runs, which lock the chat until the run finishes.
+New chats and messages run in the desktop app by default: the message goes into the chat's queue and the app sends it, so the user sees it live and can type in the chat. If the chat is busy, the message waits in the queue (action "queued") and must not be sent again. Set execution to "background" explicitly for headless runs, which lock the chat until the run finishes.
 Typical flow: list_chats or create_chat, then send_message, then wait_for_chat and read_chat.
 Use list_models to discover valid model, reasoning effort, and speed values.`;
 const MACHINE_INSTRUCTIONS = (localName) => `
@@ -63,7 +63,7 @@ async function forward(name, target, args) {
     return remoteValue(await target.remote.callTool(name, args), target.name);
 }
 const chatId = z.string().min(1).describe('Chat id from list_chats or create_chat.');
-const execution = z.enum(['app', 'background']).optional().describe('Default app: opens the chat in the desktop app so the user can steer it live. Background explicitly uses the headless engine and locks the chat while running.');
+const execution = z.enum(['app', 'background']).optional().describe('Default app: the desktop app runs the message, live in its window. Background explicitly uses the headless engine and locks the chat while running.');
 const turnOptions = {
     model: z.string().optional().describe('Model id from list_models. Defaults to the chat or app default.'),
     effort: z.string().optional().describe('Reasoning effort supported by the model, for example low, medium, high, xhigh.'),
@@ -231,7 +231,7 @@ export function createMcpServer(bridge, scope, version, router) {
         return server;
     register('create_chat', {
         title: 'Create chat',
-        description: 'Creates and opens a Codex chat in the desktop app, where the user can type while it works. With a prompt it starts immediately. Use execution background explicitly for headless runs. Without a project, creates a folder under the workspace root.',
+        description: 'Creates a Codex chat in the desktop app with the requested model, effort, and speed, and runs the prompt there. Returns turnStarted false with a note if the prompt is still queued; it will run without being sent again. Use execution background explicitly for headless runs. Without a project, creates a folder under the workspace root.',
         inputSchema: {
             prompt: z.string().optional().describe('First message. Omit to create an empty chat.'),
             project: z.string().optional().describe('Project name from list_projects or an absolute folder path.'),
@@ -252,16 +252,16 @@ export function createMcpServer(bridge, scope, version, router) {
     });
     register('send_message', {
         title: 'Send message',
-        description: 'Sends a message to an existing chat. If the chat is open in the ChatGPT app, it is sent through the app and appears live there.',
+        description: 'Sends a message to an existing chat through the ChatGPT app, where it appears live. Model, effort, or speed can only be changed while the chat is not loaded in the app.',
         inputSchema: {
             chatId,
             message: z.string().min(1),
             execution,
             ...turnOptions,
             whenBusy: z
-                .enum(['reject', 'steer', 'interrupt'])
+                .enum(['reject', 'queue', 'steer', 'interrupt'])
                 .optional()
-                .describe('If the chat is already running: reject (default), steer the running turn, or interrupt it and start a new turn.'),
+                .describe('If the chat is already running: reject (default), queue it to run after the current turn, steer the running turn, or interrupt it first. Steer and interrupt only work for background runs.'),
             wait: z.boolean().optional().describe('Wait for the turn to finish (up to waitSeconds).'),
             waitSeconds: z.number().int().min(1).max(300).optional().describe('Default 60.'),
         },

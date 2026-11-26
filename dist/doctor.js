@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { AppServerClient } from './appServer.js';
 import { TokenStore } from './auth.js';
 import { DesktopIpcClient } from './ipc.js';
-import { APP_BUNDLE_PATHS, configDir, ipcSocketPath, resolveCodexBinary } from './paths.js';
+import { APP_BUNDLE_PATHS, configDir, resolveCodexBinary } from './paths.js';
 import { agentState, readServiceConfig } from './service.js';
 import { errorMessage } from './util.js';
 function appVersion(bundle) {
@@ -57,7 +57,7 @@ export async function runDoctor(version, codexBinary) {
     }
     const ipc = new DesktopIpcClient();
     if (!ipc.isAvailable()) {
-        checks.push({ name: 'Live app control', ok: false, detail: `${ipcSocketPath()} not found. Open the ChatGPT app to control open chats live.` });
+        checks.push({ name: 'Live app control', ok: true, detail: 'not available; app chats are delivered through the chat queue (steer and interrupt only work for background runs)' });
     }
     else {
         try {
@@ -65,7 +65,8 @@ export async function runDoctor(version, codexBinary) {
             checks.push({ name: 'Live app control', ok: true, detail: 'connected to the app IPC router' });
         }
         catch (error) {
-            checks.push({ name: 'Live app control', ok: false, detail: errorMessage(error) });
+            // ChatGPT 26.1120 removed the router and may leave a stale socket behind.
+            checks.push({ name: 'Live app control', ok: true, detail: `not available (${errorMessage(error)}); app chats are delivered through the chat queue` });
         }
         finally {
             ipc.close();
